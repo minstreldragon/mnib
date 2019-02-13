@@ -10,6 +10,17 @@
     V 0.15   2nd try for parallel port fix
     V 0.16   next try with adjustments to ECP ports
     V 0.17   added automatic drive type detection
+    V 0.18   added 41 track support
+    V 0.19   added Density and Halftrack command switches
+    V 0.20   added Bump and Reset options
+    V 0.21   added timeout routine for nibble transfer
+    V 0.22   added flush command during reading
+    V 0.23   disable interrupts during serial protocol
+    V 0.24   improved serial protocol
+    V 0.25   got rid of some more msleep()s
+    V 0.26   added 'S' track reading (read without waiting for Sync)
+    V 0.27   added hidden 'g' switch for GEOS 1.2 disk image
+    V 0.28   improved killer detection (changed retries $80 -> $c0)
 */
 
 #include "cbm.h"
@@ -17,7 +28,7 @@
 #include <stdlib.h>
 #include <sys/movedata.h>
 
-#define VERSION 0.17
+#define VERSION 0.28
 #define FD 1                /* (unused) file number for cbm_routines */
 
 #define FL_STEPTO      0x00
@@ -29,18 +40,25 @@
 #define FL_SCANDENSITY 0x07
 #define FL_READWOSYNC  0x08
 #define FL_TEST        0x0a
-#define FL_SOFTSTEP    0x10
+#define FL_VERIFY_CODE 0x10
+
+#define DISK_NORMAL    0
+#define DISK_GEOS      1
 
 static int start_track;
 static int end_track;
 static int track_inc;
+static int use_default_density;
 static int current_track;
 static unsigned int lpt[4];
 static int lpt_num;
 static int drivetype;
+static unsigned char *floppy_code;
+static unsigned int floppybytes;
+static int disktype;
 
 char bitrate_range[4] =
-{ 42*2, 31*2, 25*2, 18*2 };
+{ 43*2, 31*2, 25*2, 18*2 };
 
 char bitrate_value[4] =
 { 0x00, 0x20, 0x40, 0x60 };
@@ -54,6 +72,10 @@ unsigned char track_density[84];
 void usage(void)
 {
     fprintf(stderr, "usage: mnib <output>\n");
+    fprintf(stderr, " -b: Bump before reading\n");
+    fprintf(stderr, " -d: Use scanned density\n");
+    fprintf(stderr, " -h: Add Halftracks\n");
+    fprintf(stderr, " -r: Reset Drives\n");
     exit(1);
 }
 
@@ -62,7 +84,6 @@ void upload_code(char *floppyfile)
 {
     FILE *fpin;
     unsigned int databytes, dataread;
-    unsigned char *buffer;
     unsigned int start;
     unsigned int patch_pos[9] =
     { 0x72, 0x89, 0x9e, 0x1da, 0x224, 0x258, 0x262, 0x293, 0x2a6 };
@@ -79,13 +100,13 @@ void upload_code(char *floppyfile)
     databytes = ftell(fpin);
     rewind(fpin);
 
-    if((buffer = calloc(databytes, sizeof(unsigned char))) == NULL)
+    if((floppy_code = calloc(databytes, sizeof(unsigned char))) == NULL)
     {
         fprintf(stderr, "Couldn't allocate upload buffer!\n");
         exit(2);
     }
 
-    dataread = fread(buffer, sizeof(unsigned char), databytes, fpin);
+    dataread = fread(floppy_code, sizeof(unsigned char), databytes, fpin);
 
     if (dataread != databytes)
     {
@@ -95,7 +116,7 @@ void upload_code(char *floppyfile)
 
     printf("databytes = %ld\n", databytes);
 
-    start = buffer[0] + (buffer[1] << 8);
+    start = floppy_code[0] + (floppy_code[1] << 8);
     printf("Startadress: $%04x\n",start);
 
     /* patch code if using 1571 drive */
@@ -103,15 +124,16 @@ void upload_code(char *floppyfile)
     {
         for (i = 0; i < 9; i++)
         {
-            if (buffer[patch_pos[i]] != 0x18)
+            if (floppy_code[patch_pos[i]] != 0x18)
                 printf("Possibly bad patch at %04x!\n",patch_pos[i]);
-            buffer[patch_pos[i]] = 0x40;
+            floppy_code[patch_pos[i]] = 0x40;
         }
     }
 
-    cbm_upload(FD, 8, start, buffer+2, databytes-2); 
+    cbm_upload(FD, 8, start, floppy_code+2, databytes-2); 
 
-    free(buffer);
+    floppybytes = databytes;
+
     fclose(fpin);
 }
 
@@ -145,6 +167,26 @@ int test_par_port()
     return rv;
 }
 
+int verify_floppy()
+{
+    int i, rv;
+
+    send_par_cmd(FL_VERIFY_CODE);
+    for (i = 2, rv = 1; i < floppybytes; i++)
+    {
+        if (cbm_par_read(FD) != floppy_code[i])
+        {
+            rv = 0;
+            printf("diff: %d\n", i);
+        }
+    }
+    for (; i < 0x0800-0x0300+2; i++)
+        cbm_par_read(FD);
+
+    if (cbm_par_read(FD) != 0) rv = 0;
+    return rv;
+}
+
 int find_par_port()
 {
     int i;
@@ -158,6 +200,15 @@ int find_par_port()
         printf(" no\n");
     }
     return (0); /* no parallel port found */
+}
+
+int set_full_track()
+{
+    send_par_cmd(FL_MOTOR);
+    cbm_par_write(FD, 0xfc); /* $1c00 CLEAR mask (clear stepper bits) */
+    cbm_par_write(FD, 0x02); /* $1c00  SET  mask (stepper bits = %10) */
+    cbm_par_read(FD);
+    delay(500); /* wait for motor to step */
 }
 
 int motor_on()
@@ -319,15 +370,18 @@ int readdisk(FILE *fpout, char *track_header)
 {
     int track;
     int density, defdensity;
+    int scan_density;
     int i;
     int header_entry;
-    unsigned char buffer[0x2000];
+    unsigned char buffer[0x2100];
+    int timeout;
+    int byte;
 
     if (!test_par_port()) return 0;
 
     printf("READ DISK\n");  
     motor_on();
-    delay(500);
+
     header_entry = 0;
     for (track = start_track; track <= end_track; track += track_inc)
     {
@@ -338,39 +392,102 @@ int readdisk(FILE *fpout, char *track_header)
         for (defdensity = 3; track >= bitrate_range[defdensity]; defdensity--);
         printf("(%d) ", (defdensity & 3));
 
-        density = scan_track(track);
-        track_density[track] = density;
-        if (density & 0x80)
+        scan_density = scan_track(track);
+        track_density[track] = scan_density;
+        if (scan_density & 0x80)
         {
             printf("F");
-            density = defdensity;
+            memset(buffer, 0xff, 0x2000);
+            for (i = 0; i < 0x2000; i++)
+                fputc(buffer[i], fpout);
+            continue; /* track holds no DOS data */
         }
-        else if (density & 0x40)
+        else if (scan_density & 0x40)
         {
             printf("S");
-            density = defdensity;
+/*
+            memset(buffer, 0x00, 0x2000);
+            for (i = 0; i < 0x2000; i++)
+                fputc(buffer[i], fpout);
+            continue;
+*/
         }
-        else printf("%d", (density & 3));
-        density = defdensity;
+        else printf("%d", (scan_density & 3));
+
+        density = (use_default_density || (scan_density & 0x40)) ? defdensity : (scan_density & 3);
+
+        if ((disktype == DISK_GEOS) && (track == 36*2 ))
+        {
+            printf(" GEOS!");
+            density = 3;
+        }
+
+        printf(" -> %d", density);
 
         track_header[header_entry*2] = track;
-        track_header[header_entry*2+1] = density;
+
+        if (scan_density & 0x80)
+            track_header[header_entry*2+1] = 'F';
+        else if (scan_density & 0x40)
+            track_header[header_entry*2+1] = 'S';
+        else
+            track_header[header_entry*2+1] = density;
+
         header_entry++;
 
-        send_par_cmd(FL_DENSITY);
-        cbm_par_write(FD, density_branch[density]);
-        cbm_par_write(FD, 0x9f);                   /* $1c00 CLEAR mask */
-        cbm_par_write(FD, bitrate_value[density]); /* $1c00  SET  mask */
-        cbm_par_read(FD);
-
-        send_par_cmd(FL_READNORMAL);
-        cbm_par_read(FD);
-        for (i = 0; i < 0x2000; i+=2)
+        do
         {
-            buffer[i]   = cbm_nib_read1(FD);
-            buffer[i+1] = cbm_nib_read2(FD);
-        }
-//        delay(500);
+            send_par_cmd(FL_DENSITY);
+            cbm_par_write(FD, density_branch[density]);
+            cbm_par_write(FD, 0x9f);                   /* $1c00 CLEAR mask */
+            cbm_par_write(FD, bitrate_value[density]); /* $1c00  SET  mask */
+            cbm_par_read(FD);
+
+            fflush(NULL);
+
+            disable();
+         
+            if (scan_density & 0x40)
+                send_par_cmd(FL_READWOSYNC);
+            else
+                send_par_cmd(FL_READNORMAL);
+            cbm_par_read(FD);
+
+            timeout = 0;
+            for (i = 0; i < 0x2000; i+=2)
+            {
+                byte = cbm_nib_read1(FD);
+                if (byte < 0)
+                {
+                    timeout = 1;
+                    break;
+                }
+                buffer[i] = byte;
+                byte = cbm_nib_read2(FD);
+                if (byte < 0)
+                {
+                    timeout = 1;
+                    break;
+                }
+                buffer[i+1] = byte;
+            }
+            enable();
+            if (timeout)
+            {
+                printf("r");
+                printf("%02x\n", cbm_par_read(FD));
+                delay(500);
+                printf("bla\n");
+                printf("%02x\n", cbm_par_read(FD));
+                delay(500);
+                printf("%02x ", cbm_par_read(FD));
+                delay(500);
+                printf("%02x ", cbm_par_read(FD));
+                fprintf(stderr, "%s", test_par_port() ? "+" : "-");
+            }
+        } while (timeout);
+
+
         cbm_par_read(FD);
 
         for (i = 0; i < 0x2000; i++)
@@ -386,11 +503,13 @@ int main(int argc, char *argv[])
     int i;
     int byte;
     int fd;
+    int bump, reset;
     unsigned char buffer[500];
     unsigned char error[500];
     unsigned char cmd[80];
     char outname[80];
     char header[0x100];
+    int ok;
 
     FILE *fpout;
 
@@ -398,13 +517,41 @@ int main(int argc, char *argv[])
     printf("\nmnib - Commodore G64 disk image nibbler v%.2f", VERSION);
     printf("\n (C) 2000 Markus Brenner\n\n");
 
-    if (argc < 2) usage();
-
+    bump = reset = 0;
     start_track = 1*2;
-    end_track = 35*2;
+    end_track = 41*2;
     track_inc = 2;
+    use_default_density = 1;
+    disktype = DISK_NORMAL;
 
-    strcpy(outname, argv[1]);
+    while (--argc && (*(++argv)[0] == '-'))
+    {
+        switch (tolower((*argv)[1]))
+        {
+            case 'b':
+                bump = 1;
+                break;
+            case 'h':
+                track_inc = 1;
+                break;
+            case 'd':
+                use_default_density = 0;
+                break;
+            case 'r':
+                reset = 1;
+                break;
+            case 'g':
+                disktype = DISK_GEOS;
+                break;
+            default:
+                break;
+        }
+    }
+
+
+    if (argc < 1) usage();
+
+    strcpy(outname, argv[0]);
     if ((fpout = fopen(outname,"wb")) == NULL)
     {
         fprintf(stderr, "Couldn't open output file %s!\n", outname);
@@ -418,7 +565,7 @@ int main(int argc, char *argv[])
         fputc(header[i], fpout);
     }
 
-    if (!detect_ports()) exit (3);
+    if (!detect_ports(reset)) exit (3);
 
     /* prepare error string $73: CBM DOS V2.6 1541 */
     sprintf(cmd,"M-W%c%c%c%c%c%c%c%c",0,3,5,0xa9,0x73,0x4c,0xc1,0xe6);
@@ -437,6 +584,17 @@ int main(int argc, char *argv[])
 
     printf("Drive type: %d\n", drivetype);
     
+    if (bump)
+    {
+        /* perform a bump */
+        delay(1000);
+        printf("Bumping...\n");
+        sprintf(cmd,"M-W%c%c%c%c%c",6,0,2,1,0);
+        cbm_exec_command(fd, 8, cmd, 8);
+        sprintf(cmd,"M-W%c%c%c%c",0,0,1,0xc0);
+        cbm_exec_command(fd, 8, cmd, 7);
+        delay(2500);
+    }
 
     cbm_exec_command(fd, 8, "U0>M0", 0);
     cbm_exec_command(fd, 8, "I0:", 0);
@@ -445,11 +603,6 @@ int main(int argc, char *argv[])
     upload_code("bn_flop.prg");
     sprintf(cmd,"M-E%c%c",0x00,0x03);
     cbm_exec_command(fd, 8, cmd, 5);
-/*
-    cbm_listen(FD,8,15);
-    cbm_write(FD,cmd,5);
-    cbm_unlisten(FD);
-*/
 
     cbm_par_read(FD);
     if (!find_par_port()) exit (4);
@@ -457,10 +610,15 @@ int main(int argc, char *argv[])
 /*
     scan_density();
 */
-
     fprintf(stderr, "test: %s\n", test_par_port() ? "OK" : "FAILED");
+    fprintf(stderr, "test: %s\n", test_par_port() ? "OK" : "FAILED");
+    fprintf(stderr, "test: %s\n", test_par_port() ? "OK" : "FAILED");
+    fprintf(stderr, "code: %s\n", (ok=verify_floppy()) ? "OK" : "FAILED");
+    if (!ok) exit (5);
+
     readdisk(fpout, header+0x10);
-    printf("%02x \n",cbm_par_read(FD));
+    printf("\n");
+    cbm_par_read(FD);
 
 
     rewind(fpout);

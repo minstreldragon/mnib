@@ -1,34 +1,18 @@
-/*
- * n2d.c - Converts nibbler data to D64 image
- *
- * Written by
- *  Markus Brenner (markus@brenner.de)
- * Based on d64tog64.c code by
- *  Andreas Boose  (boose@unixserv.rz.fh-hannover.de)
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
- *  02111-1307  USA.
- *
- */
+/* n2d.c - Converts mnib nibbler data to D64 image
+
+    (C) 2000,01 Markus Brenner <markus@brenner.de>
+
+    Based on code by Andreas Boose <boose@unixserv.rz.fh-hannover.de>
+
+    V 0.19   fixed usage message, only use 35 tracks for now
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 
-#define VERSION 0.13
+#define VERSION 0.19
 
 #define BYTE unsigned char
 #define DWORD unsigned int
@@ -159,7 +143,6 @@ static int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector, int track,
 
     if (track > 40) return (0); /* only 40 tracks stored in sixpack */
 
-    if (sector == 0) printf("(%02d) ", track); /* screen info */
     gcr_ptr = gcr_track;
     gcr_end= gcr_track+0x2000;
 
@@ -172,7 +155,12 @@ static int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector, int track,
 
         convert_4bytes_from_GCR(gcr_ptr, header);
         convert_4bytes_from_GCR(gcr_ptr+5, header+4);
+    } while ((header[0]!=0x08) || (header[2]!=sector));
+/*
     } while ((header[0]!=0x08) || (header[2]!=sector) || (header[3]!=track));
+*/
+    if (header[3] != track)
+        printf("T%d ", header[3]);
 
     if ((header[5]==diskID1) || (header[4]==diskID2))
         printf(".");
@@ -234,7 +222,7 @@ static int write_dword(FILE *fd, DWORD *buf, int num)
 void usage(void)
 {
     fprintf(stderr, "Wrong number of arguments.\n"
-    "Usage: g2d g64image [d64image]\n\n");
+    "Usage: n2d data [d64image]\n\n");
     exit (-1);
 }
 
@@ -348,13 +336,14 @@ int main(int argc, char **argv)
                 goto fail;
             }
 
-		    blockindex++;
+            blockindex++;
         }
     }
 
     if (save_errorinfo)
     {
-        if (fwrite((char *) errorinfo, BLOCKSONDISK, 1, fdd64) != 1) {
+        if (fwrite((char *) errorinfo, BLOCKSONDISK, 1, fdd64) != 1)
+        {
             fprintf(stderr, "Cannot write error information.\n");
             goto fail;
         }

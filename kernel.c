@@ -74,6 +74,7 @@ static unsigned char portval[4];           /* current value in output register *
 
 static int eoi;
 static int irq_count;
+static uclock_t t_timeout;
 
 
 void msleep(unsigned long usec)
@@ -86,6 +87,21 @@ void msleep(unsigned long usec)
 
 	while(uclock() < stop);
 }
+
+void minit(unsigned long usec)
+{
+	uclock_t start, stop;
+	unsigned long ticks;
+
+	start = uclock();
+	t_timeout = start + ((float)usec*UCLOCKS_PER_SEC/1000000);
+}
+
+int mtimeout()
+{
+    return (uclock() >= t_timeout);
+}
+
 
 /*
  *  dump input lines
@@ -116,30 +132,30 @@ static void do_reset( void )
 static int send_byte(int b)
 {
         int i, ack = 0;
+        int j;
 
 /*
         DPRINTK("send_byte %02x\n", b);
 */
-/*
         disable();
-*/
 
         for( i = 0; i < 8; i++ ) {
-                msleep(70);
+//                msleep(70);
+                for (j=0; j < 70; j++) GET(DATA_IN);
                 if( !((b>>i) & 1) ) {
                         SET(DATA_OUT);
                 }
                 RELEASE(CLK_OUT);
-                msleep(20);
+//                msleep(20);
+                for (j=0; j < 20; j++) GET(DATA_IN);
                 SET(CLK_OUT);
                 RELEASE(DATA_OUT);
         }
         for( i = 0; (i < 20) && !(ack=GET(DATA_IN)); i++ ) {
-                msleep(100);
+//                msleep(100);
+                for (j=0; j < 100; j++) GET(DATA_IN);
         }
-/*
         enable();
-*/
 
         DPRINTK("ack=%d\n", ack);
 
@@ -151,10 +167,12 @@ static int send_byte(int b)
  */
 static void wait_for_listener()
 {
+        int j;
 /*
         SHOW("waiting for device");
 */
 
+        disable();
         RELEASE(CLK_OUT);
 
         while(GET(DATA_IN));
@@ -167,10 +185,12 @@ static void wait_for_listener()
                 return;
         }
         DPRINTK("signaling EOI\n");
-        msleep(150);
+//        msleep(150);
+        for (j=0; j < 150; j++) GET(DATA_IN);
         while(!GET(DATA_IN));
         while(GET(DATA_IN));
         SET(CLK_OUT);
+        enable();
 }
 
 /*
@@ -210,6 +230,7 @@ int cbm_read(int f, char *buf, int count)
                 for(i = 0; (i < 40) && !(ok=GET(CLK_IN)); i++) {
                         msleep(10);
                 }
+
                 if(!ok) {
                         /* device signals eoi */
                         eoi = 1;
@@ -217,21 +238,28 @@ int cbm_read(int f, char *buf, int count)
                         msleep(70);
                         RELEASE(DATA_OUT);
                 }
+
+                disable();
+
                 for(i = 0; i < 100 && !(ok=GET(CLK_IN)); i++) {
-                        msleep(20);
+//                        msleep(2);
                 }
+//                if (i==100) printf("TIMEOUT 1\n");
+
                 for(bit = b = 0; (bit < 8) && ok; bit++) {
                         for(i = 0; (i < 200) && !(ok=(GET(CLK_IN)==0)); i++) {
-                                msleep(10);
+//                                msleep(2);
                         }
+//                        if (i==200) printf("TIMEOUT 2\n");
                         if(ok) {
                                 b >>= 1;
                                 if(GET(DATA_IN)==0) {
                                         b |= 0x80;
                                 }
                                 for(i = 0; i < 100 && !(ok=GET(CLK_IN)); i++) {
-                                        msleep(20);
+//                                        msleep(20);
                                 }
+//                                if (i==100) printf("TIMEOUT 3\n");
                         }
                 }
                 if(ok) {
@@ -239,9 +267,9 @@ int cbm_read(int f, char *buf, int count)
                         SET(DATA_OUT);
                         *buf++ = (char)b;
                 }
-/*
+
                 enable();
-*/
+
                 msleep(50);
 
         } while(received < count && ok && !eoi);
@@ -258,6 +286,7 @@ static int cbm_raw_write(const char *buf, size_t cnt, int atn, int talk)
         int i;
         int rv   = 0;
         int sent = 0;
+        int j;
         
         eoi = irq_count =  0;
 
@@ -268,6 +297,7 @@ static int cbm_raw_write(const char *buf, size_t cnt, int atn, int talk)
         }
         SET(CLK_OUT);
         RELEASE(DATA_OUT);
+        GET(DATA_IN); /* WAIT */
 
         for(i=0; (i<100) && !GET(DATA_IN); i++) {
             msleep(10);
@@ -300,16 +330,13 @@ static int cbm_raw_write(const char *buf, size_t cnt, int atn, int talk)
         DPRINTK("%d bytes sent, rv=%d\n", sent, rv);
 
         if(talk) {
-/*
                 disable();
-*/
                 SET(DATA_OUT);
                 RELEASE(ATN_OUT);
-                msleep(30);
+//                msleep(30);
+                for (j=0; j < 50; j++) GET(DATA_IN);
                 RELEASE(CLK_OUT);
-/*
                 enable();
-*/
         } else {
                 RELEASE(ATN_OUT);
         }
@@ -327,6 +354,7 @@ int cbm_ioctl(int f, unsigned int cmd, unsigned long arg)
 {
         unsigned char buf[2], c, talk;
         int rv = 0;
+        int j;
 
         buf[0] = (arg >> 8) & 0x1f;  /* device */
         buf[1] = arg & 0x0f;         /* secondary address */
@@ -407,14 +435,16 @@ int cbm_ioctl(int f, unsigned int cmd, unsigned long arg)
                         return 0;
 
                 case CBMCTRL_PAR_READ:
-//                        PARREAD();
                         RELEASE(DATA_OUT|CLK_OUT);
                         SET(ATN_OUT);
 //                        msleep(10); /* 200? */
+                        for (j=0; j < 20; j++) GET(DATA_IN);
                         while(GET(DATA_IN));
                         rv = inportb(parport);
+                        for (j=0; j < 5; j++) GET(DATA_IN); // extra
                         RELEASE(ATN_OUT);
-                        msleep(10);
+//                        msleep(10);
+                        for (j=0; j < 20; j++) GET(DATA_IN);
                         while(!GET(DATA_IN));
 //                        PARWRITE();
                         return rv;
@@ -422,15 +452,16 @@ int cbm_ioctl(int f, unsigned int cmd, unsigned long arg)
                 case CBMCTRL_PAR_WRITE:
                         RELEASE(DATA_OUT|CLK_OUT);
                         SET(ATN_OUT);
-                        msleep(10);
+//                        msleep(10);
+                        for (j=0; j < 20; j++) GET(DATA_IN);
                         while(GET(DATA_IN));
                         PARWRITE();
                         outportb(parport, arg);
-/*
-                        msleep(10);
-*/
+                        for (j=0; j < 5; j++) GET(DATA_IN);
+//                        msleep(10);
                         RELEASE(ATN_OUT);
-                        msleep(10);
+//                        msleep(10);
+                        for (j=0; j < 20; j++) GET(DATA_IN);
                         while(!GET(DATA_IN));
                         PARREAD();
 /*
@@ -443,20 +474,29 @@ int cbm_ioctl(int f, unsigned int cmd, unsigned long arg)
 
 int cbm_nib_read1(int f)
 {
+    int to;
+    int j;
 //    PARREAD();
+    to = 0;
     RELEASE(DATA_OUT);
-    while (GET(DATA_IN));
-/*
-    inportb(parport);
-*/
+    for (j=0; j < 2; j++) GET(DATA_IN);
+    while (GET(DATA_IN))
+        if (to++ > 1000000) return (-1);
+//        if(mtimeout()) return (-1);
     return inportb(parport);
 }
 
 int cbm_nib_read2(int f)
 {
+    int to;
+    int j;
 //    PARREAD();
+    to = 0;
     RELEASE(DATA_OUT);
-    while (!GET(DATA_IN));
+    for (j=0; j < 2; j++) GET(DATA_IN);
+    while (!GET(DATA_IN))
+        if (to++ > 1000000) return (-1);
+//        if(mtimeout()) return (-1);
 /*
     inportb(parport);
 */
@@ -513,8 +553,7 @@ int set_par_port(int port)
     else return (0);
 }
 
-
-int detect_ports()
+int detect_ports(int reset)
 {
     int i;
     unsigned char byte[8];
@@ -561,6 +600,24 @@ int detect_ports()
         outportb(port+0x402, (ecr & 0x1f) | 0x20);
     }
 
+    if (reset)
+    {
+        printf("Resetting drives...\n");
+        for (i = 0; i < lpt_num; i++)
+        {
+            serport = lpt[i];
+            portval[i] = 0xc0;
+            serportval   = &portval[i];
+
+            RELEASE(DATA_OUT | ATN_OUT | CLK_OUT);
+            SET(RESET_OUT);
+            delay(100); /* 100ms */
+
+            RELEASE(RESET_OUT);
+        }
+        printf("cbm_init: sleeping 5 seconds...\n");
+        delay(5000); /* 5s */
+    }
 
     goodport = -1;
     for (i = 0; i < lpt_num; i++)

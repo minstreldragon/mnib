@@ -172,7 +172,7 @@ _set_1c00              JSR  _read_byte	; read byte from parallel data port
 
 ;----------------------------------------
 					; detect 'killer tracks'
-_detect_killer         LDX  #$80	;
+_detect_killer         LDX  #$c0	; ORIGINAL: #$80 (better detection)
                        STY  $c0		;
 _dkL1                  LDA  $1c00	; wait for end of Sync
                        BPL  _dk_nobytes	; check for 'empty' track
@@ -544,6 +544,22 @@ _marker                CPX  #$37	; check for MARKER BYTE
                        JMP  _in_sync	; -> read out track
 
 ;----------------------------------------
+
+_verify_code           LDY  #$00	;
+                       STY  $c0
+                       LDA  #$03
+                       STA  $c1
+_verify_L1             LDA  ($c0),Y
+                       JSR  _send_byte	; parallel-send data byte to C64
+                       INY 
+                       BNE  _verify_L1	;
+                       INC  $c1
+                       LDA  $c1
+                       CMP  #$08
+                       BNE  _verify_L1
+                       RTS  		;
+
+;----------------------------------------
 ;--- Command Jump table               ---; return value: Y
 ;----------------------------------------
 _command_table         .byte <(_step_dest-1), >(_step_dest-1)
@@ -578,5 +594,7 @@ _command_table         .byte <(_step_dest-1), >(_step_dest-1)
 					; find GCR byte before 'hole' or 'Sync'
                        .byte <(_read_from_mark-1), >(_read_from_mark-1)
 					; read out track from MARKER BYTE
+                       .byte <(_verify_code-1), >(_verify_code-1)
+					; send floppy side code back to PC
 
 _command_header        .byte $ff,$aa,$55,$00	; command header code

@@ -1,34 +1,19 @@
-/*
- * n2g.c - Converts nibbler data to G64 image
- *
- * Written by
- *  Markus Brenner (markus@brenner.de)
- * Based on d64tog64.c code by
- *  Andreas Boose  (boose@unixserv.rz.fh-hannover.de)
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
- *  02111-1307  USA.
- *
- */
+/* n2g - Converts mnib nibbler data to G64 image
+
+    (C) 2000,01 Markus Brenner <markus@brenner.de>
+
+    Based on code by Andreas Boose <boose@unixserv.rz.fh-hannover.de>
+
+    V 0.21   use correct speed values in G64
+*/
+
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 
-#define VERSION 0.13
+#define VERSION 0.21
 
 #define BYTE unsigned char
 #define DWORD unsigned int
@@ -143,6 +128,45 @@ int is_sector_zero(BYTE *data)
 }
 
 
+BYTE *check_vmax(BYTE *mnib_track)
+{
+    static BYTE vmax_track[0x2100];
+    BYTE *source, *dest;
+    int isvmax;
+    BYTE current, pilot;
+
+
+    isvmax=0;
+    pilot = 0;
+    for(source = mnib_track, dest = vmax_track; source < mnib_track+0x2000; source++)
+    {
+        current = *source;
+        if (current == 0x49)
+        {
+            if (pilot == 0)
+                *dest++ = 0xff; /* insert Sync byte */
+            pilot++;
+        }
+        else if ((current == 0xee) && (pilot > 5))
+        {
+            isvmax++;
+        }
+        else pilot = 0;
+
+        *dest++ = *source;
+    }
+
+
+    if (isvmax >= 5)
+    {
+        printf("v-max!");
+        return (vmax_track+1); /* skip 1st $ff byte */
+    }
+    else
+        return mnib_track;
+}
+
+
 DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
 {
 /*
@@ -153,11 +177,15 @@ DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
     BYTE *first_sync_pos;
     BYTE *sector_zero_pos;
     BYTE *max_len_pos;
+
+    BYTE *repeat_pos;
+    BYTE *cycle_pos;	/* here starts the 2nd cycle */
+
     int block_len, max_block_len;
     int sector_zero_len;
     int syncs;
     int i;
-    int cyclepos;
+    int cyclelen;
 
 
     sector_zero_pos = NULL;
@@ -165,12 +193,11 @@ DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
     max_len_pos = mnib_track;
     max_block_len = 0;
     syncs = 0;
-    cyclepos = 0;
+    cyclelen = 0;
 
     for (sync_pos = mnib_track; sync_pos != NULL;)
     {
         last_sync_pos = sync_pos;
-        start_pos = mnib_track;
         syncs++; /* count number of syncs in track */
         printf(".");
 
@@ -198,25 +225,30 @@ DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
         if ((sync_pos-mnib_track) < 0x1780) continue;
 
         /* we are possibly already in the second rotation, check for repeat */
-        while(sync_pos != NULL)
+        start_pos = mnib_track;
+        for (repeat_pos = sync_pos; sync_pos != NULL; )
         {
             printf("!");
 
             for (i = 0; i < 7; i++)
+                if (start_pos[i] != repeat_pos[i]) break;
+
+            if (i != 7)
             {
-                if (start_pos[i] != sync_pos[i]) break;
+                printf("%d",i);
+                break; /* break out of while loop */
             }
-            if (i != 7) break; /* break out of while loop */
-            if (cyclepos == 0)
-            {
-                cyclepos = (sync_pos - start_pos);
-                printf("cycle: %d\n", cyclepos);
-            }
-            sync_pos  = find_sync(sync_pos, sync_pos-mnib_track);
-            start_pos = find_sync(start_pos, start_pos-mnib_track);
+            cycle_pos = sync_pos;
+            cyclelen = (cycle_pos - mnib_track);
+            printf("cycle: %d\n", cyclelen);
+
+            start_pos  = find_sync(start_pos, start_pos-mnib_track);
+            repeat_pos = find_sync(repeat_pos, repeat_pos-mnib_track);
+
+            if (repeat_pos == NULL) sync_pos = NULL;
 
             /* check if next header is completely available */
-            if ((sync_pos-mnib_track+10) > 0x2000) sync_pos = NULL;
+            if ((repeat_pos-mnib_track+10) > 0x2000) sync_pos = NULL;
         }
     }
 
@@ -226,29 +258,79 @@ DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
     }
 
     printf("Startpos:  %d\n", max_len_pos-mnib_track);
-    printf("Cyclepos:  %d\n", cyclepos);
-
+    if (cyclelen >= 7900)
+    {
+        max_len_pos = mnib_track;
+        cyclelen = 7900; /* hack for psi5 killertrack */
+    }
+    printf("Cyclepos:  %d\n", cyclelen);
+    if (cyclelen != 7900)
+    {
 
     /* find start of sync */
     sync_pos = max_len_pos;
     do
     {
         sync_pos--;
-        if (sync_pos < mnib_track) sync_pos += cyclepos;
+        if (sync_pos < mnib_track) sync_pos += cyclelen;
     } while (*sync_pos == 0xff);
     sync_pos++;
-    if (sync_pos >= mnib_track+cyclepos) sync_pos = mnib_track;
+    if (sync_pos >= mnib_track+cyclelen) sync_pos = mnib_track;
     max_len_pos = sync_pos;
 
+    }
 
     /* here comes the actual copy loop */
-    for (sync_pos = max_len_pos; sync_pos < mnib_track+cyclepos; )
+    for (sync_pos = max_len_pos; sync_pos < cycle_pos; )
         *gcr_track++ = *sync_pos++;
 
     for (sync_pos = mnib_track; sync_pos < max_len_pos; )
         *gcr_track++ = *sync_pos++;
 
-    return (cyclepos);
+    return (cyclelen);
+}
+
+
+
+DWORD extract_track_try2(BYTE *mnib_track, BYTE *gcr_track)
+{
+    BYTE *pos;
+    BYTE *start_pos;
+    BYTE *stop_pos;
+    BYTE *cycle_pos;
+
+    int cyclelen;
+    int i;
+
+    start_pos = mnib_track;
+    stop_pos = mnib_track+0x2000;
+    cycle_pos = NULL;
+
+
+    for (pos = start_pos+0x1780; pos < (stop_pos-50); pos++)
+    {
+        for (i = 0; i < 50; i++)
+            if (start_pos[i] != pos[i]) break;
+
+        if (i == 50)
+        {
+            cycle_pos = pos;
+            break;
+        }
+    }
+
+    if (cycle_pos == NULL)
+        return (0);
+
+    cyclelen = cycle_pos-mnib_track;
+
+    printf("Cyclepos:  %d\n", cyclelen);
+
+    /* here comes the actual copy loop */
+    for (pos = start_pos; pos < cycle_pos; )
+        *gcr_track++ = *pos++;
+
+    return (cyclelen);
 }
 
 
@@ -348,7 +430,7 @@ void SetFileExtension(char *str, char *ext)
 void usage(void)
 {
     fprintf(stderr, "Wrong number of arguments.\n"
-    "Usage: n2g data [d64image]\n\n");
+    "Usage: n2g data [g64image]\n\n");
     exit (-1);
 }
 
@@ -364,24 +446,19 @@ int main(int argc, char **argv)
     DWORD gcr_speed_p[MAX_TRACKS_1541 * 2];
     DWORD track_len;
     BYTE mnib_track[0x2000];
+    BYTE *source_track;
     BYTE gcr_track[7930];
     BYTE errorinfo[MAXBLOCKSONDISK];
     BYTE errorcode;
     int save_errorinfo;
     BYTE *gcrptr;
     unsigned long blockindex;
-    int mnib_header[0x100];
+    BYTE mnib_header[0x100];
 	
-
-#if defined DJGPP
-    _fmode = O_BINARY;
-#endif
-
 
     fprintf(stdout,
 "\nn2g is a small stand-alone converter to convert mnib data to\n"
-"a standard G64 disk image.  Copyright 2000 Markus Brenner.\n"
-"This is free software, covered by the GNU General Public License.\n"
+"a standard G64 disk image.  Copyright 2000,01 Markus Brenner.\n"
 "Version %.2f\n\n", VERSION);
 
     id[0]=id[1]=id[2] = '\0';
@@ -399,20 +476,20 @@ int main(int argc, char **argv)
     }
     else usage();
 
-/*
-    SetFileExtension(inname, "NIB");
-*/
+
     SetFileExtension(outname, ".G64");
 
 
     fpin = fopen(inname, "rb");
-    if (fpin == NULL) {
+    if (fpin == NULL)
+    {
         fprintf(stderr, "Cannot open mnib image %s.\n", inname);
         exit (-1);
     }
 
     fpout = fopen(outname, "wb");
-    if (fpout == NULL) {
+    if (fpout == NULL)
+    {
         fprintf(stderr, "Cannot open G64 image %s.\n", outname);
         exit (-1);
     }
@@ -427,29 +504,34 @@ int main(int argc, char **argv)
 
     /* Create G64 header */
     strcpy((char *) gcr_header, "GCR-1541");
-    gcr_header[8] = 0;
-    gcr_header[9] = MAX_TRACKS_1541 * 2;
-    gcr_header[10] = 7928 % 256;
+    gcr_header[8] = 0;                    /* G64 version */
+    gcr_header[9] = MAX_TRACKS_1541 * 2;  /* Number of Halftracks */
+    gcr_header[10] = 7928 % 256;          /* Size of each stored track */
     gcr_header[11] = 7928 / 256;
 
-    if (fwrite((char *)gcr_header, sizeof(gcr_header), 1, fpout) != 1) {
+    if (fwrite((char *)gcr_header, sizeof(gcr_header), 1, fpout) != 1)
+    {
         fprintf(stderr, "Cannot write G64 header.\n");
         goto fail;
     }
 
     /* Create index and speed tables */
     for (track = 0; track < MAX_TRACKS_1541; track++) {
+        /* calculate track positions */
         gcr_track_p[track * 2] = 12 + MAX_TRACKS_1541 * 16 + track * 7930;
-        gcr_track_p[track * 2 + 1] = 0;
-        gcr_speed_p[track * 2] = speed_map_1541[track];
+        gcr_track_p[track * 2 + 1] = 0; /* no halftracks */
+        /* set speed zone data */
+        gcr_speed_p[track * 2] = (mnib_header[17+track*2] & 0x0f);
         gcr_speed_p[track * 2 + 1] = 0;
     }
 
-    if (write_dword(fpout, gcr_track_p, sizeof(gcr_track_p)) < 0) {
+    if (write_dword(fpout, gcr_track_p, sizeof(gcr_track_p)) < 0)
+    {
         fprintf(stderr, "Cannot write track header.\n");
         goto fail;
     }
-    if (write_dword(fpout, gcr_speed_p, sizeof(gcr_speed_p)) < 0) {
+    if (write_dword(fpout, gcr_speed_p, sizeof(gcr_speed_p)) < 0)
+    {
         fprintf(stderr, "Cannot write speed header.\n");
         goto fail;
     }
@@ -463,50 +545,50 @@ int main(int argc, char **argv)
         gcr_track[0] = raw_track_size[speed_map_1541[track]] % 256;
         gcr_track[1] = raw_track_size[speed_map_1541[track]] / 256;
 
-        if (track < 35)
+        /* read in one track */
+        if (fread(mnib_track, 0x2000, 1, fpin) < 1)
         {
-	    /* read in one track */
-            if (fread(mnib_track, 0x2000, 1, fpin) < 1)
-            {
-                fprintf(stderr, "Cannot read track from mnib image.\n");
-                goto fail;
-            }
-    
+            /* track doesn't exist: write blank track */
+            fprintf(stderr, "Cannot read track from mnib image.\n");
             printf("\nTrack: %2d ",track+1);
-            track_len = extract_track(mnib_track, gcr_track+2);
-
-            if (track_len == 0)
-            {
-                track_len = raw_track_size[speed_map_1541[track]];
-                memset(&gcr_track[2], 0x55, track_len);
-                gcr_track[2] = 0xff;
-            }
+            track_len = raw_track_size[speed_map_1541[track]];
+            memset(&gcr_track[2], 0x55, track_len);
+            gcr_track[2] = 0xff;
 
             gcr_track[0] = track_len % 256;
             gcr_track[1] = track_len / 256;
-
             if (fwrite((char *) gcr_track, sizeof(gcr_track), 1, fpout) != 1)
             {
                 fprintf(stderr, "Cannot write track data.\n");
                 goto fail;
             }
+            continue;
         }
-        else
+   
+        printf("\nTrack: %2d ",track+1);
+/*
+        source_track = check_vmax(mnib_track);
+*/
+        track_len = extract_track(mnib_track, gcr_track+2);
+        if (track_len == 0)
+            track_len = extract_track_try2(mnib_track, gcr_track+2);
+
+        if (track_len == 0)
         {
-            /* track > 35: write blank track */
-            printf("\nTrack: %2d ",track+1);
-            gcr_track[0] = 0 % 256;
-            gcr_track[1] = 0 / 256;
-            if (fwrite((char *) gcr_track, sizeof(gcr_track), 1, fpout) != 1)
-            {
-                fprintf(stderr, "Cannot write track data.\n");
-                goto fail;
-            }
+            track_len = raw_track_size[speed_map_1541[track]];
+            memset(&gcr_track[2], 0x55, track_len);
+            gcr_track[2] = 0xff;
         }
 
-    
-    }
+        gcr_track[0] = track_len % 256;
+        gcr_track[1] = track_len / 256;
 
+        if (fwrite((char *) gcr_track, sizeof(gcr_track), 1, fpout) != 1)
+        {
+            fprintf(stderr, "Cannot write track data.\n");
+            goto fail;
+        }
+    }
 
 fail:
     fclose(fpin);
