@@ -21,14 +21,18 @@
     V 0.26   added 'S' track reading (read without waiting for Sync)
     V 0.27   added hidden 'g' switch for GEOS 1.2 disk image
     V 0.28   improved killer detection (changed retries $80 -> $c0)
+    V 0.29   added direct D64 nibble functionality
+    V 0.30   added D64 error correction by multiple read
 */
 
 #include "cbm.h"
+#include "gcr.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/movedata.h>
 
-#define VERSION 0.28
+#define VERSION 0.30
 #define FD 1                /* (unused) file number for cbm_routines */
 
 #define FL_STEPTO      0x00
@@ -45,6 +49,10 @@
 #define DISK_NORMAL    0
 #define DISK_GEOS      1
 
+#define IMAGE_NIB      0    /* destination image format */
+#define IMAGE_D64      1
+#define IMAGE_G64      2
+
 static int start_track;
 static int end_track;
 static int track_inc;
@@ -53,9 +61,10 @@ static int current_track;
 static unsigned int lpt[4];
 static int lpt_num;
 static int drivetype;
-static unsigned char *floppy_code;
+static BYTE *floppy_code;
 static unsigned int floppybytes;
 static int disktype;
+static int imagetype;
 
 char bitrate_range[4] =
 { 43*2, 31*2, 25*2, 18*2 };
@@ -63,10 +72,10 @@ char bitrate_range[4] =
 char bitrate_value[4] =
 { 0x00, 0x20, 0x40, 0x60 };
 
-static unsigned char density_branch[4] =
+static BYTE density_branch[4] =
 { 0xb1, 0xb5, 0xb7, 0xb9 };
 
-unsigned char track_density[84];
+BYTE track_density[84];
 
 
 void usage(void)
@@ -77,6 +86,21 @@ void usage(void)
     fprintf(stderr, " -h: Add Halftracks\n");
     fprintf(stderr, " -r: Reset Drives\n");
     exit(1);
+}
+
+
+int compare_extension(char *filename, char *extension)
+{
+    char *dot;
+
+    dot = strrchr(filename, '.');
+    if (dot == NULL) return (0);
+
+    for (++dot; *dot != '\0'; dot++, extension++)
+        if (tolower(*dot) != tolower(*extension)) return (0);
+
+    if (*extension == '\0') return (1);
+    else return (0);
 }
 
 
@@ -100,13 +124,13 @@ void upload_code(char *floppyfile)
     databytes = ftell(fpin);
     rewind(fpin);
 
-    if((floppy_code = calloc(databytes, sizeof(unsigned char))) == NULL)
+    if((floppy_code = calloc(databytes, sizeof(BYTE))) == NULL)
     {
         fprintf(stderr, "Couldn't allocate upload buffer!\n");
         exit(2);
     }
 
-    dataread = fread(floppy_code, sizeof(unsigned char), databytes, fpin);
+    dataread = fread(floppy_code, sizeof(BYTE), databytes, fpin);
 
     if (dataread != databytes)
     {
@@ -138,7 +162,7 @@ void upload_code(char *floppyfile)
 }
 
 
-void send_par_cmd(unsigned char cmd)
+void send_par_cmd(BYTE cmd)
 {
     cbm_par_write(FD, 0x00);
     cbm_par_write(FD, 0x55);
@@ -239,7 +263,7 @@ int step_to_halftrack(int halftrack)
 
 int reset_floppy()
 {
-    unsigned char cmd[80];
+    BYTE cmd[80];
 
     motor_on();
     step_to_halftrack(36);
@@ -268,7 +292,7 @@ int set_bitrate(int density) /* $13d6 */
 
 int set_default_bitrate(int track) /* $13bc */
 {
-    unsigned char density;
+    BYTE density;
 
     for (density = 3; track >= bitrate_range[density]; density--);
 /*
@@ -285,10 +309,10 @@ int set_default_bitrate(int track) /* $13bc */
 
 int scan_track(int track) /* $152b Density Scan*/
 {
-    unsigned char density;
-    unsigned char killer_info;
+    BYTE density;
+    BYTE killer_info;
     int i, bin;
-    unsigned char count;
+    BYTE count;
     unsigned int goodbest, statbest;
     unsigned int goodmax, statmax;
 
@@ -366,135 +390,266 @@ int scan_density(void)
 }
 
 
+
+int read_halftrack(int halftrack, BYTE *buffer)
+{
+    int density, defdensity;
+    int scanned_density;
+    int timeout;
+    int byte;
+    int i;
+
+    step_to_halftrack(halftrack);
+    printf("\n%4.1f: ",(float)halftrack/2);
+    for (defdensity = 3; halftrack >= bitrate_range[defdensity]; defdensity--);
+    printf("(%d) ", (defdensity & 3));
+
+    scanned_density = scan_track(halftrack);
+    if (scanned_density & 0x80)
+    {
+        /* killer track */
+        printf("F");
+        memset(buffer, 0xff, 0x2000);
+        return (0x80);
+    }
+    else if (scanned_density & 0x40)
+    {
+        /* no sync found */
+        printf("S");
+    }
+    else printf("%d", (scanned_density & 3));
+
+    density = (use_default_density || (scanned_density & 0x40))
+              ? defdensity : (scanned_density & 3);
+
+    if ((disktype == DISK_GEOS) && (halftrack == 36*2 ))
+    {
+        printf(" GEOS!");
+        density = 3;
+    }
+
+    printf(" -> %d", density);
+
+    do
+    {
+        send_par_cmd(FL_DENSITY);
+        cbm_par_write(FD, density_branch[density]);
+        cbm_par_write(FD, 0x9f);                   /* $1c00 CLEAR mask */
+        cbm_par_write(FD, bitrate_value[density]); /* $1c00  SET  mask */
+        cbm_par_read(FD);
+
+        fflush(NULL);
+
+        disable();
+         
+        if (scanned_density & 0x40)
+            send_par_cmd(FL_READWOSYNC);
+        else
+            send_par_cmd(FL_READNORMAL);
+        cbm_par_read(FD);
+
+        timeout = 0;
+        for (i = 0; i < 0x2000; i+=2)
+        {
+            byte = cbm_nib_read1(FD);
+            if (byte < 0)
+            {
+                timeout = 1;
+                break;
+            }
+            buffer[i] = byte;
+            byte = cbm_nib_read2(FD);
+            if (byte < 0)
+            {
+                timeout = 1;
+                break;
+            }
+            buffer[i+1] = byte;
+        }
+        enable();
+        if (timeout)
+        {
+            printf("r");
+            printf("%02x\n", cbm_par_read(FD));
+            delay(500);
+            printf(".\n");
+            printf("%02x\n", cbm_par_read(FD));
+            delay(500);
+            printf("%02x ", cbm_par_read(FD));
+            delay(500);
+            printf("%02x ", cbm_par_read(FD));
+            fprintf(stderr, "%s", test_par_port() ? "+" : "-");
+        }
+    } while (timeout);
+
+    cbm_par_read(FD);
+    return (density);
+}
+
+
 int readdisk(FILE *fpout, char *track_header)
 {
     int track;
-    int density, defdensity;
-    int scan_density;
-    int i;
+    int density;
     int header_entry;
-    unsigned char buffer[0x2100];
-    int timeout;
-    int byte;
-
-    if (!test_par_port()) return 0;
-
-    printf("READ DISK\n");  
-    motor_on();
+    BYTE buffer[0x2100];
+    int i;
 
     header_entry = 0;
     for (track = start_track; track <= end_track; track += track_inc)
     {
-        step_to_halftrack(track);
-        printf("\n%02d: ",track);
-
-
-        for (defdensity = 3; track >= bitrate_range[defdensity]; defdensity--);
-        printf("(%d) ", (defdensity & 3));
-
-        scan_density = scan_track(track);
-        track_density[track] = scan_density;
-        if (scan_density & 0x80)
-        {
-            printf("F");
-            memset(buffer, 0xff, 0x2000);
-            for (i = 0; i < 0x2000; i++)
-                fputc(buffer[i], fpout);
-            continue; /* track holds no DOS data */
-        }
-        else if (scan_density & 0x40)
-        {
-            printf("S");
-/*
-            memset(buffer, 0x00, 0x2000);
-            for (i = 0; i < 0x2000; i++)
-                fputc(buffer[i], fpout);
-            continue;
-*/
-        }
-        else printf("%d", (scan_density & 3));
-
-        density = (use_default_density || (scan_density & 0x40)) ? defdensity : (scan_density & 3);
-
-        if ((disktype == DISK_GEOS) && (track == 36*2 ))
-        {
-            printf(" GEOS!");
-            density = 3;
-        }
-
-        printf(" -> %d", density);
-
+        density = read_halftrack(track, buffer);
         track_header[header_entry*2] = track;
 
-        if (scan_density & 0x80)
+        if (density & 0x80)
             track_header[header_entry*2+1] = 'F';
-        else if (scan_density & 0x40)
+        else if (density & 0x40)
             track_header[header_entry*2+1] = 'S';
         else
             track_header[header_entry*2+1] = density;
 
         header_entry++;
 
-        do
-        {
-            send_par_cmd(FL_DENSITY);
-            cbm_par_write(FD, density_branch[density]);
-            cbm_par_write(FD, 0x9f);                   /* $1c00 CLEAR mask */
-            cbm_par_write(FD, bitrate_value[density]); /* $1c00  SET  mask */
-            cbm_par_read(FD);
-
-            fflush(NULL);
-
-            disable();
-         
-            if (scan_density & 0x40)
-                send_par_cmd(FL_READWOSYNC);
-            else
-                send_par_cmd(FL_READNORMAL);
-            cbm_par_read(FD);
-
-            timeout = 0;
-            for (i = 0; i < 0x2000; i+=2)
-            {
-                byte = cbm_nib_read1(FD);
-                if (byte < 0)
-                {
-                    timeout = 1;
-                    break;
-                }
-                buffer[i] = byte;
-                byte = cbm_nib_read2(FD);
-                if (byte < 0)
-                {
-                    timeout = 1;
-                    break;
-                }
-                buffer[i+1] = byte;
-            }
-            enable();
-            if (timeout)
-            {
-                printf("r");
-                printf("%02x\n", cbm_par_read(FD));
-                delay(500);
-                printf("bla\n");
-                printf("%02x\n", cbm_par_read(FD));
-                delay(500);
-                printf("%02x ", cbm_par_read(FD));
-                delay(500);
-                printf("%02x ", cbm_par_read(FD));
-                fprintf(stderr, "%s", test_par_port() ? "+" : "-");
-            }
-        } while (timeout);
-
-
-        cbm_par_read(FD);
-
+        /* process and save track to disk */
         for (i = 0; i < 0x2000; i++)
             fputc(buffer[i], fpout);
     }
     step_to_halftrack(4*2);
 }
+
+
+
+int read_d64(FILE *fpout)
+{
+    int density;
+    int track, sector;
+    int csec; /* compare sector variable */
+    int blockindex;
+    int save_errorinfo;
+    int retry;
+    BYTE buffer[0x2100];
+    BYTE id[3];
+    BYTE rawdata[260];
+    BYTE sectordata[16*21*260];
+    BYTE errorinfo[MAXBLOCKSONDISK];
+    BYTE errorcode;
+    int sector_count[21];     /* number of different sector data read */
+    int sector_occur[21][16]; /* how many times was this sector data read? */
+    int sector_error[21][16]; /* type of error on this sector data */
+    int sector_use[21];       /* best data for this sector so far */
+    int sector_max[21];       /* # of times the best sector data has occured */
+    int goodtrack;
+    int goodsector;
+
+
+
+    blockindex = 0;
+    save_errorinfo = 0;
+
+    density = read_halftrack(18*2, buffer);
+    if (!extract_id(buffer, id))
+    {
+        fprintf(stderr, "Cannot find directory sector.\n");
+        return (0);
+    }
+
+
+    for (track = 1; track <= 35; track += 1)
+    {
+        /* no sector data read in yet */
+        for (sector = 0; sector < 21; sector++)
+            sector_count[sector] = 0;
+
+        for (retry = 0; retry < 16; retry++)
+        {
+            goodtrack = 1;
+            read_halftrack(2*track, buffer);
+            for (sector = 0; sector < sector_map_1541[track]; sector++)
+            {
+                sector_max[sector] = 0;
+                /* convert sector to free sector buffer */
+                errorcode = convert_GCR_sector(buffer, rawdata,
+                                               track, sector, id);
+
+                /* check, if identical sector has been read before */
+                for (csec = 0; csec < sector_count[sector]; csec++)
+                {
+                    if ((memcmp(sectordata+(21*csec+sector)*260, rawdata, 260)
+                        == 0) && (sector_error[sector][csec] == errorcode))
+                    {
+                        sector_occur[sector][csec] += 1;
+                        break;
+                    }
+                }
+                if (csec == sector_count[sector])
+                {
+                    /* sectordaten sind neu, kopieren, zaehler erhoehen */
+                    memcpy(sectordata+(21*csec+sector)*260, rawdata, 260);
+                    sector_occur[sector][csec] = 1;
+                    sector_error[sector][csec] = errorcode;
+                    sector_count[sector] += 1;
+                }
+
+                goodsector = 0;
+                for (csec = 0; csec < sector_count[sector]; csec++)
+                {
+                    if (sector_occur[sector][csec]-((sector_error[sector][csec]==OK)?0:8)
+                        > sector_max[sector])
+                    {
+                        sector_use[sector] = csec;
+                        sector_max[sector] = csec;
+                    }
+
+                    if (sector_occur[sector][csec]-((sector_error[sector][csec]==OK)?0:8)
+                        > (retry / 2 + 1))
+                    {
+                        goodsector = 1;
+                    }
+                }
+                if (goodsector == 0)
+                    goodtrack = 0;
+            } /* for sector.... */
+            if (goodtrack == 1) break; /* break out of for loop */
+        } /* for retry.... */
+
+
+        /* save the best data for each sector */
+
+        for (sector = 0; sector < sector_map_1541[track]; sector++)
+        {
+            printf("%d",sector);
+
+            if (fwrite((char *) sectordata+1+(21*sector_use[sector]+sector)*260,
+                       256, 1, fpout) != 1)
+            {
+                fprintf(stderr, "Cannot write sector data.\n");
+                return (0);
+            }
+
+            errorcode = sector_error[sector][sector_use[sector]];
+            errorinfo[blockindex] = errorcode;
+            if (errorcode != OK)
+                save_errorinfo = 1;
+
+            /* screen information */
+            if (errorcode == OK)
+                printf(" ");
+            else
+                printf("%d",errorcode);
+            blockindex++;
+       }
+    } /* track loop */
+    if (save_errorinfo == 1)
+    {
+        if (fwrite((char *) errorinfo, blockindex, 1, fpout) != 1)
+        {
+            fprintf(stderr, "Cannot write sector data.\n");
+            return (0);
+        }
+    }
+    return (1);
+}
+
 
 
 int main(int argc, char *argv[])
@@ -504,9 +659,9 @@ int main(int argc, char *argv[])
     int byte;
     int fd;
     int bump, reset;
-    unsigned char buffer[500];
-    unsigned char error[500];
-    unsigned char cmd[80];
+    BYTE buffer[500];
+    BYTE error[500];
+    BYTE cmd[80];
     char outname[80];
     char header[0x100];
     int ok;
@@ -515,7 +670,7 @@ int main(int argc, char *argv[])
 
 
     printf("\nmnib - Commodore G64 disk image nibbler v%.2f", VERSION);
-    printf("\n (C) 2000 Markus Brenner\n\n");
+    printf("\n (C) 2000,01 Markus Brenner\n\n");
 
     bump = reset = 0;
     start_track = 1*2;
@@ -558,11 +713,22 @@ int main(int argc, char *argv[])
         exit(2);
     }
 
-    memset(header, 0x00, 0x100);
-    sprintf(header, "MNIB-1541-RAW%c%c%c",1,0,0);
-    for (i = 0; i < 0x100; i++)
+    if (compare_extension(outname, "D64"))
+        imagetype = IMAGE_D64;
+    else if (compare_extension(outname, "G64"))
+        imagetype = IMAGE_G64;
+    else
+        imagetype = IMAGE_NIB;
+
+    /* write NIB-header if appropriate */
+    if (imagetype == IMAGE_NIB)
     {
-        fputc(header[i], fpout);
+        memset(header, 0x00, 0x100);
+        sprintf(header, "MNIB-1541-RAW%c%c%c",1,0,0);
+        for (i = 0; i < 0x100; i++)
+        {
+            fputc(header[i], fpout);
+        }
     }
 
     if (!detect_ports(reset)) exit (3);
@@ -611,22 +777,33 @@ int main(int argc, char *argv[])
     scan_density();
 */
     fprintf(stderr, "test: %s\n", test_par_port() ? "OK" : "FAILED");
-    fprintf(stderr, "test: %s\n", test_par_port() ? "OK" : "FAILED");
-    fprintf(stderr, "test: %s\n", test_par_port() ? "OK" : "FAILED");
     fprintf(stderr, "code: %s\n", (ok=verify_floppy()) ? "OK" : "FAILED");
     if (!ok) exit (5);
 
-    readdisk(fpout, header+0x10);
+    /* read out disk into file */
+    motor_on();
+
+
+    if (imagetype == IMAGE_NIB)
+        readdisk(fpout, header+0x10);
+    else if (imagetype == IMAGE_D64)
+        read_d64(fpout);
+
     printf("\n");
     cbm_par_read(FD);
 
 
-    rewind(fpout);
-    for (i = 0; i < 0x100; i++)
+    /* fill NIB-header if appropriate */
+    if (imagetype == IMAGE_NIB)
     {
-        fputc(header[i], fpout);
+        rewind(fpout);
+        for (i = 0; i < 0x100; i++)
+        {
+            fputc(header[i], fpout);
+        }
+        fseek(fpout, 0, SEEK_END);
     }
-    fseek(fpout, 0, SEEK_END);
+
     fclose(fpout);
 
     motor_on();

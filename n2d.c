@@ -5,249 +5,41 @@
     Based on code by Andreas Boose <boose@unixserv.rz.fh-hannover.de>
 
     V 0.19   fixed usage message, only use 35 tracks for now
+    V 0.20   improved disk error detection
+    V 0.21   split program in n2d.c and gcr.h/gcr.c
+    V 0.22   added halftrack-image support
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-
-#define VERSION 0.19
-
-#define BYTE unsigned char
-#define DWORD unsigned int
-#define MAX_TRACKS_1541 42
-#define MAXSTRLEN 80
-#define HEADLONG 8
-
-#define BLOCKSONDISK 683
-#define BLOCKSEXTRA 85
-#define MAXBLOCKSONDISK (BLOCKSONDISK+BLOCKSEXTRA)
-
-#define OK				1
-#define NOT_FOUND_ERROR	4
-#define CHECKSUM_ERROR	5
-
-static char sector_map_1541[43] =
-{
-    0,
-    21, 21, 21, 21, 21, 21, 21, 21, 21, 21,     /*  1 - 10 */
-    21, 21, 21, 21, 21, 21, 21, 19, 19, 19,     /* 11 - 20 */
-    19, 19, 19, 19, 18, 18, 18, 18, 18, 18,     /* 21 - 30 */
-    17, 17, 17, 17, 17,                         /* 31 - 35 */
-    17, 17, 17, 17, 17, 17, 17          /* Tracks 36 - 42 are non-standard. */
-};
+#include "gcr.h"
 
 
-static int speed_map_1541[42] = { 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-                                  3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1,
-                                  1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                                  0, 0, 0 };
-
-
-static BYTE GCR_conv_data[16] = { 0x0a, 0x0b, 0x12, 0x13,
-                                  0x0e, 0x0f, 0x16, 0x17,
-                                  0x09, 0x19, 0x1a, 0x1b,
-                                  0x0d, 0x1d, 0x1e, 0x15 };
-
-static int GCR_decode[32] = { -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
-                              -1, 0x8, 0x0, 0x1,  -1, 0xc, 0x4, 0x5,
-                              -1,  -1, 0x2, 0x3,  -1, 0xf, 0x6, 0x7,
-                              -1, 0x9, 0xa, 0xb,  -1, 0xd, 0xe,  -1 };
-                             
-
-static void convert_4bytes_to_GCR(BYTE *buffer, BYTE *ptr)
-{
-    *ptr = GCR_conv_data[(*buffer) >> 4] << 3;
-    *ptr |= GCR_conv_data[(*buffer) & 0x0f] >> 2;
-    ptr++;
-
-    *ptr = GCR_conv_data[(*buffer) & 0x0f] << 6;
-    buffer++;
-    *ptr |= GCR_conv_data[(*buffer) >> 4] << 1;
-    *ptr |= GCR_conv_data[(*buffer) & 0x0f] >> 4;
-    ptr++;
-
-    *ptr = GCR_conv_data[(*buffer) & 0x0f] << 4;
-    buffer++;
-    *ptr |= GCR_conv_data[(*buffer) >> 4] >> 1;
-    ptr++;
-
-    *ptr = GCR_conv_data[(*buffer) >> 4] << 7;
-    *ptr |= GCR_conv_data[(*buffer) & 0x0f] << 2;
-    buffer++;
-    *ptr |= GCR_conv_data[(*buffer) >> 4] >> 3;
-    ptr++;
-
-    *ptr = GCR_conv_data[(*buffer) >> 4] << 5;
-    *ptr |= GCR_conv_data[(*buffer) & 0x0f];
-}
-
-
-int convert_4bytes_from_GCR(BYTE *gcr, BYTE *plain)
-{
-    int hnibble, lnibble;
-
-    if((hnibble = GCR_decode[gcr[0] >> 3]) < 0) return -1;
-    if((lnibble = GCR_decode[((gcr[0] << 2) | (gcr[1] >> 6)) & 0x1f]) < 0) return -1;
-    *plain++ = hnibble << 4 | lnibble;
-    if((hnibble = GCR_decode[(gcr[1] >> 1) & 0x1f]) < 0) return -1;
-    if((lnibble = GCR_decode[((gcr[1] << 4) | (gcr[2] >> 4)) & 0x1f]) < 0) return -1;
-    *plain++ = hnibble << 4 | lnibble;
-    if((hnibble = GCR_decode[((gcr[2] << 1) | (gcr[3] >> 7)) & 0x1f]) < 0) return -1;
-    if((lnibble = GCR_decode[(gcr[3] >> 2) & 0x1f]) < 0) return -1;
-    *plain++ = hnibble << 4 | lnibble;
-    if((hnibble = GCR_decode[((gcr[3] << 3) | (gcr[4] >> 5)) & 0x1f]) < 0) return -1;
-    if((lnibble = GCR_decode[gcr[4] & 0x1f]) < 0) return -1;
-    *plain++ = hnibble << 4 | lnibble;
-
-    return(1);
-}
-
-
-
-/*
-int read_GCR_id(BYTE *sixpack, BYTE *id)
-{
-    BYTE buf[4];
-
-    if (convert_4bytes_from_GCR(sixpack+5,buf))
-    {
-        id[0]=buf[1];
-        id[1]=buf[0];
-        id[2]='\0';
-        printf("Disk ID: %s (0x%02x 0x%02x)\n", id, id[0], id[1]);
-        return(1);
-    }
-    else
-    {
-        printf("WARNING: Couldn't read disk ID!\n");
-        id[0]=id[1]=0;
-        id[2]='\0';
-        return(0);
-    }
-}
-*/
-
-
-
-static int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector, int track,
-                                  int sector, BYTE diskID1, BYTE diskID2)
-{
-    int i;
-    BYTE header[10];
-    BYTE chksum;
-    BYTE *gcr_ptr, *gcr_end;
-    BYTE *sectordata;
-
-
-    if (track > 40) return (0); /* only 40 tracks stored in sixpack */
-
-    gcr_ptr = gcr_track;
-    gcr_end= gcr_track+0x2000;
-
-    do
-    {
-        for (; *gcr_ptr != 0xff; gcr_ptr++) /* find sync */
-            if (gcr_ptr >= gcr_end) return (0);
-        for (; *gcr_ptr == 0xff; gcr_ptr++);
-            if (gcr_ptr >= gcr_end) return (0);
-
-        convert_4bytes_from_GCR(gcr_ptr, header);
-        convert_4bytes_from_GCR(gcr_ptr+5, header+4);
-    } while ((header[0]!=0x08) || (header[2]!=sector));
-/*
-    } while ((header[0]!=0x08) || (header[2]!=sector) || (header[3]!=track));
-*/
-    if (header[3] != track)
-        printf("T%d ", header[3]);
-
-    if ((header[5]==diskID1) || (header[4]==diskID2))
-        printf(".");
-    else
-        printf("-");
-
-    for (; *gcr_ptr != 0xff; gcr_ptr++) /* find sync */
-        if (gcr_ptr >= gcr_end) return (0);
-    for (; *gcr_ptr == 0xff; gcr_ptr++);
-        if (gcr_ptr >= gcr_end) return (0);
-    
-
-    for (i = 0, sectordata = d64_sector; i < 65; i++)
-    {
-        convert_4bytes_from_GCR(gcr_ptr, sectordata);
-        gcr_ptr += 5;
-        sectordata += 4;
-    }
-
-    for (i = 1, chksum = 0; i < 258; i++)
-        chksum ^= d64_sector[i];
-    if (chksum  != 0)
-	{
-        printf("C");
-		return (CHECKSUM_ERROR);
-	}
-
-    return (OK);
-}
-
-
-
-
-static int write_dword(FILE *fd, DWORD *buf, int num)
-{
-    int i;
-    BYTE *tmpbuf;
-
-    tmpbuf = malloc(num);
-
-    for (i = 0; i < (num / 4); i++) {
-        tmpbuf[i * 4] = buf[i] & 0xff;
-        tmpbuf[i * 4 + 1] = (buf[i] >> 8) & 0xff;
-        tmpbuf[i * 4 + 2] = (buf[i] >> 16) & 0xff;
-        tmpbuf[i * 4 + 3] = (buf[i] >> 24) & 0xff;
-    }
-
-    if (fwrite((char *)tmpbuf, num, 1, fd) < 1) {
-        free(tmpbuf);
-        return -1;
-    }
-    free(tmpbuf);
-    return 0;
-}
-
-
+#define VERSION 0.22
 
 
 void usage(void)
 {
-    fprintf(stderr, "Wrong number of arguments.\n"
-    "Usage: n2d data [d64image]\n\n");
+    fprintf(stderr, "Usage: n2d data [d64image]\n\n");
     exit (-1);
 }
 
 
 int main(int argc, char **argv)
 {
-    FILE *fdg64, *fdd64;
-    char g64name[1024], d64name[1024];
-    BYTE *sixpack_data;
+    FILE *fp_nib, *fp_d64;
+    char nibname[1024], d64name[1024];
     int track, sector;
-    BYTE gcr_header[12], id[3];
-    DWORD gcr_track_p[MAX_TRACKS_1541 * 2];
-    DWORD gcr_speed_p[MAX_TRACKS_1541 * 2];
-    BYTE gcr_track[0x2000], rawdata[260];
+    BYTE id[3];
+    BYTE gcr_track[GCR_TRACK_LENGTH], rawdata[260];
     BYTE errorinfo[MAXBLOCKSONDISK];
-	BYTE errorcode;
-	int save_errorinfo;
-    BYTE *gcrptr;
-	unsigned long blockindex;
+    BYTE errorcode;
+    int save_errorinfo;
+    int blockindex;
+    BYTE nib_header[0x100];
+    int header_offset;
 	
-
-#if defined DJGPP
-    _fmode = O_BINARY;
-#endif
-
 
     fprintf(stdout,
 "\ng2d is a small stand-alone converter to convert a G64 disk image to\n"
@@ -255,14 +47,11 @@ int main(int argc, char **argv)
 "This is free software, covered by the GNU General Public License.\n"
 "Version %.2f\n\n", VERSION);
 
-    id[0]=id[1]=id[2] = '\0';
-
-
     if (argc == 2)
     {
         char *dot;
-        strcpy(g64name, argv[1]);
-        strcpy(d64name, g64name);
+        strcpy(nibname, argv[1]);
+        strcpy(d64name, nibname);
         dot = strrchr(d64name, '.');
         if (dot != NULL)
             strcpy(dot, ".d64");
@@ -271,33 +60,68 @@ int main(int argc, char **argv)
     }
     else if (argc == 3)
     {
-        strcpy(g64name, argv[1]);
+        strcpy(nibname, argv[1]);
         strcpy(d64name, argv[2]);
     }
     else usage();
 
-
-    fdg64 = fopen(g64name, "rb");
-    if (fdg64 == NULL) {
-        fprintf(stderr, "Cannot open G64 image %s.\n", g64name);
+    fp_nib = fopen(nibname, "rb");
+    if (fp_nib == NULL)
+    {
+        fprintf(stderr, "Cannot open G64 image %s.\n", nibname);
         exit (-1);
     }
 
-    fdd64 = fopen(d64name, "wb");
-    if (fdd64 == NULL) {
+    fp_d64 = fopen(d64name, "wb");
+    if (fp_d64 == NULL)
+    {
         fprintf(stderr, "Cannot open D64 image %s.\n", d64name);
         exit (-1);
     }
 
-    fseek(fdg64, 0x100, SEEK_SET);
+    if (fread(nib_header, sizeof(BYTE), 0x0100, fp_nib) < 0x0100)
+    {
+        fprintf(stderr, "Cannot read nibble image header.\n");
+        goto fail;
+    }
+
+    /* figure out the disk ID from Track 18, Sector 0 */
+    id[0]=id[1]=id[2] = '\0';
+    if (nib_header[0x10+17*2] == 18*2) /* normal nibble file */
+        fseek(fp_nib, 17*GCR_TRACK_LENGTH+0x100, SEEK_SET);
+    else /* halftrack nibble file */
+        fseek(fp_nib, 2*17*GCR_TRACK_LENGTH+0x100, SEEK_SET);
+
+    if (fread(gcr_track, sizeof(BYTE), GCR_TRACK_LENGTH, fp_nib) < GCR_TRACK_LENGTH)
+    {
+        fprintf(stderr, "Cannot read track from G64 image.\n");
+        goto fail;
+    }
+    if (!extract_id(gcr_track, id))
+    {
+        fprintf(stderr, "Cannot find directory sector.\n");
+        goto fail;
+    }
+    printf("ID: %2x %2x\n", id[0], id[1]);
+
+    /* reset file pointer to first track */
+    fseek(fp_nib, 0x100, SEEK_SET);
 
     blockindex = 0;
     save_errorinfo = 0;
+    header_offset = 0x10; /* number of first nibble-track in nib image */
     for (track = 0; track < 35; track++)
     {
+        /* Skip halftracks if present in image */
+        if (nib_header[header_offset] < (track + 1) * 2)
+        {
+            fseek(fp_nib, GCR_TRACK_LENGTH, SEEK_CUR); 
+            header_offset += 2;
+        }
+        header_offset += 2;
 
 	/* read in one track */
-        if (fread(gcr_track, 0x2000, 1, fdg64) < 1)
+        if (fread(gcr_track, sizeof(BYTE), GCR_TRACK_LENGTH, fp_nib) < GCR_TRACK_LENGTH)
         {
             fprintf(stderr, "Cannot read track from G64 image.\n");
             goto fail;
@@ -307,31 +131,21 @@ int main(int argc, char **argv)
 
         for (sector = 0; sector < sector_map_1541[track + 1]; sector++)
         {
-            BYTE chksum;
-            int i;
-
             printf("%d",sector);
 
-
             errorcode = convert_GCR_sector(gcr_track, rawdata,
-                                           track + 1, sector, id[0],
-                                           id[1]);
-
-            if ((errorcode != OK) && (errorcode != CHECKSUM_ERROR))
-            {
-                memset(rawdata, 0x01, 260);
-                rawdata[0] = 7;
-                rawdata[1] = 0x4b; /* Use Original Format Pattern */
-                chksum = rawdata[1];
-                for (i = 1; i < 256; i++)
-                    chksum ^= rawdata[i + 1];
-                rawdata[257] = chksum;
-            }
+                                           track + 1, sector, id);
 
             errorinfo[blockindex] = errorcode;	/* OK by default */
             if (errorcode != OK) save_errorinfo = 1;
+          
+            if (errorcode == OK)
+                printf(" ");
+            else
+                printf("%d",errorcode);
 
-            if (fwrite((char *) rawdata+1, 256, 1, fdd64) != 1) {
+            if (fwrite((char *) rawdata+1, 256, 1, fp_d64) != 1)
+            {
                 fprintf(stderr, "Cannot write sector data.\n");
                 goto fail;
             }
@@ -340,9 +154,11 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Missing: Track 36-40 detection */
+
     if (save_errorinfo)
     {
-        if (fwrite((char *) errorinfo, BLOCKSONDISK, 1, fdd64) != 1)
+        if (fwrite((char *) errorinfo, BLOCKSONDISK, 1, fp_d64) != 1)
         {
             fprintf(stderr, "Cannot write error information.\n");
             goto fail;
@@ -350,6 +166,6 @@ int main(int argc, char **argv)
     }
 
 fail:
-    fclose(fdd64);
+    fclose(fp_d64);
     return -1;
 }
