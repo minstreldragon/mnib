@@ -6,6 +6,7 @@
     V 0.30   created file based on n2d
     V 0.31   improved error handling of convert_GCR_sector()
     V 0.32   removed some functions, added sector-2-GCR conversion
+    V 0.33   improved sector extraction, added find_track_cycle() function
 */
 
 #include <stdio.h>
@@ -61,6 +62,14 @@ static BYTE GCR_decode_low[32] =
     0xff, 0xff, 0x02, 0x03, 0xff, 0x0f, 0x06, 0x07,
     0xff, 0x09, 0x0a, 0x0b, 0xff, 0x0d, 0x0e, 0xff 
 };
+
+
+int find_sync(BYTE **gcr_pptr, BYTE *gcr_end)
+{
+    while ((*gcr_pptr < gcr_end) && (**gcr_pptr != 0xff)) (*gcr_pptr)++;
+    while ((*gcr_pptr < gcr_end) && (**gcr_pptr == 0xff)) (*gcr_pptr)++;
+    return (*gcr_pptr < gcr_end);
+}
                              
 
 void convert_4bytes_to_GCR(BYTE *buffer, BYTE *ptr)
@@ -126,10 +135,7 @@ int extract_id(BYTE *gcr_track, BYTE *id)
 
     do
     {
-        for (; *gcr_ptr != 0xff; gcr_ptr++) /* find sync */
-            if (gcr_ptr >= gcr_end) return (0);
-        for (; *gcr_ptr == 0xff; gcr_ptr++)
-            if (gcr_ptr >= gcr_end) return (0);
+        if (!find_sync(&gcr_ptr, gcr_end)) return (0);
 
         convert_4bytes_from_GCR(gcr_ptr, header);
         convert_4bytes_from_GCR(gcr_ptr+5, header+4);
@@ -143,19 +149,23 @@ int extract_id(BYTE *gcr_track, BYTE *id)
 
 
 
-int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector,
-                              int track, int sector, BYTE *id)
+int convert_GCR_sector(BYTE *gcr_start, BYTE *gcr_cycle,
+                       BYTE *d64_sector,
+                       int track, int sector, BYTE *id)
 {
     BYTE header[10];    /* block header */
     BYTE hdr_chksum;    /* header checksum */
     BYTE blk_chksum;    /* block  checksum */
+    BYTE gcr_buffer[2*GCR_TRACK_LENGTH];
     BYTE *gcr_ptr, *gcr_end;
     BYTE *sectordata;
     int error_code;
     int sync_found;
+    int track_len;
     int i;
 
     if (track > MAX_TRACK_D64) return (0);
+    if ((gcr_cycle == NULL) || (gcr_cycle < gcr_start)) return (0);
 
     /* initialize sector data with Original Format Pattern */
     memset(d64_sector, 0x01, 260);
@@ -165,10 +175,16 @@ int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector,
         blk_chksum ^= d64_sector[i + 1];
     d64_sector[257] = blk_chksum;
 
+    /* copy to  temp. buffer with twice the track data */
+    track_len = gcr_cycle - gcr_start;
+    memcpy(gcr_buffer, gcr_start, track_len);
+    memcpy(gcr_buffer+track_len, gcr_start, track_len);
+    track_len *= 2;
 
     /* Check for at least one Sync */
-    gcr_end = gcr_track+GCR_TRACK_LENGTH;
-    for (sync_found = 0, gcr_ptr = gcr_track; gcr_ptr < gcr_end; gcr_ptr++)
+    gcr_end = gcr_buffer+track_len;
+    sync_found = 0;
+    for (gcr_ptr = gcr_buffer; gcr_ptr < gcr_end; gcr_ptr++)
     {
         if (*gcr_ptr == 0xff)
             if (sync_found < 2) sync_found++;
@@ -181,22 +197,18 @@ int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector,
     if (sync_found != 3) return(SYNC_NOT_FOUND);
 
     /* Try to find block header for Track/Sector */
-    gcr_ptr = gcr_track;
-    gcr_end = gcr_track+GCR_TRACK_LENGTH;
+    gcr_ptr = gcr_buffer;
+    gcr_end = gcr_buffer+track_len;
     do
     {
-        for (; *gcr_ptr != 0xff; gcr_ptr++) /* find sync */
-            if (gcr_ptr >= gcr_end) return (HEADER_NOT_FOUND);
-        for (; *gcr_ptr == 0xff; gcr_ptr++)
-            if (gcr_ptr >= gcr_end) return (HEADER_NOT_FOUND);
-
+        if (!find_sync(&gcr_ptr, gcr_end)) return (HEADER_NOT_FOUND);
+        if (gcr_ptr >= gcr_end - 10) return (HEADER_NOT_FOUND);
         convert_4bytes_from_GCR(gcr_ptr, header);
         convert_4bytes_from_GCR(gcr_ptr+5, header+4);
+        gcr_ptr++;
     } while ((header[0]!=0x08) || (header[2]!=sector) || (header[3]!=track));
 
-
     error_code = OK;
-
 
     /* Header checksum */
     hdr_chksum = 0;
@@ -210,15 +222,11 @@ int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector,
     if ((header[5]!=id[0]) || (header[4]!=id[1]))
         error_code = (error_code == OK) ? ID_MISMATCH : error_code;
 
-
-    for (; *gcr_ptr != 0xff; gcr_ptr++) /* find sync */
-        if (gcr_ptr >= gcr_end) gcr_ptr = gcr_track;
-    for (; *gcr_ptr == 0xff; gcr_ptr++)
-        if (gcr_ptr >= gcr_end) gcr_ptr = gcr_track;
-    
+    if (!find_sync(&gcr_ptr, gcr_end)) return (DATA_NOT_FOUND);
 
     for (i = 0, sectordata = d64_sector; i < 65; i++)
     {
+        if (gcr_ptr >= gcr_end-5) return (DATA_NOT_FOUND);
         convert_4bytes_from_GCR(gcr_ptr, sectordata);
         gcr_ptr += 5;
         sectordata += 4;
@@ -233,9 +241,9 @@ int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector,
     /* Block checksum */
     for (i = 1, blk_chksum = 0; i < 258; i++)
         blk_chksum ^= d64_sector[i];
+
     if (blk_chksum  != 0)
         error_code = (error_code == OK) ? BAD_DATA_CHECKSUM : error_code;
-
 
     return (error_code);
 }
@@ -279,4 +287,82 @@ void convert_sector_to_GCR(BYTE *buffer, BYTE *ptr,
     memset(ptr, 0x55, 6);       /* Gap before next sector.  */
     ptr += 6;
 
+}
+
+
+/*
+BYTE* find_track_cycle2(BYTE *start_pos)
+{
+    BYTE *pos;
+    BYTE *cycle_pos;
+    BYTE *stop_pos;
+
+    pos = start_pos + MIN_TRACK_LENGTH;
+    stop_pos = start_pos+GCR_TRACK_LENGTH-50;
+    cycle_pos = NULL;
+
+    printf("try2!\n");
+
+    while (pos < stop_pos)
+    {
+		if (memcmp(start_pos, pos, 50) == 0)
+        {
+            printf("cycle2: %x\n", pos-start_pos);
+            cycle_pos = pos;
+            break;
+        }
+		pos++;
+    }
+
+    return (cycle_pos);
+}
+*/
+
+
+
+BYTE* find_track_cycle(BYTE *start_pos)
+{
+    BYTE *sync_pos;
+    BYTE *cycle_pos;
+    BYTE *stop_pos;
+    BYTE *p1, *p2;
+    BYTE *cycle_try;
+
+    sync_pos = start_pos + MIN_TRACK_LENGTH;
+    stop_pos = start_pos+GCR_TRACK_LENGTH-MATCH_LENGTH; // -MATCH_LENGTH;
+    cycle_pos = NULL;
+
+    /* try to find next sync */
+    while (find_sync(&sync_pos, stop_pos))
+    {
+        /* found a sync, now let's see if data matches */
+        p1 = start_pos;
+        cycle_try = sync_pos;
+        for (p2 = sync_pos; p2 < stop_pos;)
+        {
+            /* try to match all remaining syncs, too */
+            if (memcmp(p1, p2, MATCH_LENGTH) != 0)
+            {
+                cycle_try = NULL;
+                break;
+            }
+//            printf("c");
+            if (!find_sync(&p1, stop_pos)) break;
+            if (!find_sync(&p2, stop_pos)) break;
+        }
+
+        if (cycle_try != NULL)
+        {
+//            printf("cycle: %x\n", cycle_try-start_pos);
+            cycle_pos = cycle_try;
+            break;
+        }
+          
+//        cycle_pos = (cycle_try != NULL) ? cycle_try : cycle_pos; 
+    }
+
+//    if (cycle_pos == NULL)
+//        cycle_pos = find_track_cycle2(start_pos);
+
+    return (cycle_pos);
 }

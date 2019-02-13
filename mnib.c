@@ -1,6 +1,6 @@
 /* mnib - Markus' G64 nibbler
 
-    (C) 20000 Markus Brenner
+    (C) 2000,01 Markus Brenner
 
     V 0.10   implementation of serial and parallel protocol
     V 0.11   first density scan and nibbler functionality
@@ -23,16 +23,20 @@
     V 0.28   improved killer detection (changed retries $80 -> $c0)
     V 0.29   added direct D64 nibble functionality
     V 0.30   added D64 error correction by multiple read
+    V 0.31   added 40 track support for D64 images
+    V 0.32   bin-include bn_flop.prg  (bin2h bn_flop.prg floppy_code bn_flop.h)
+    V 0.33   improved D64 mode
 */
 
-#include "cbm.h"
-#include "gcr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/movedata.h>
+#include "cbm.h"
+#include "gcr.h"
+#include "bn_flop.h"        /* floppy code: unsigned char floppy_code[] */
 
-#define VERSION 0.30
+#define VERSION 0.33
 #define FD 1                /* (unused) file number for cbm_routines */
 
 #define FL_STEPTO      0x00
@@ -61,7 +65,6 @@ static int current_track;
 static unsigned int lpt[4];
 static int lpt_num;
 static int drivetype;
-static BYTE *floppy_code;
 static unsigned int floppybytes;
 static int disktype;
 static int imagetype;
@@ -85,6 +88,7 @@ void usage(void)
     fprintf(stderr, " -d: Use scanned density\n");
     fprintf(stderr, " -h: Add Halftracks\n");
     fprintf(stderr, " -r: Reset Drives\n");
+
     exit(1);
 }
 
@@ -106,39 +110,16 @@ int compare_extension(char *filename, char *extension)
 
 void upload_code(char *floppyfile)
 {
-    FILE *fpin;
     unsigned int databytes, dataread;
     unsigned int start;
+    int i;
+
+    /* patchdata if using 1571 drive */
     unsigned int patch_pos[9] =
     { 0x72, 0x89, 0x9e, 0x1da, 0x224, 0x258, 0x262, 0x293, 0x2a6 };
-    int i;
- 
 
-    if ((fpin = fopen(floppyfile, "rb")) == NULL)
-    {
-        fprintf(stderr, "Couldn't open upload file %s!\n", floppyfile);
-        exit(1);
-    }
 
-    fseek(fpin, 0, SEEK_END);
-    databytes = ftell(fpin);
-    rewind(fpin);
-
-    if((floppy_code = calloc(databytes, sizeof(BYTE))) == NULL)
-    {
-        fprintf(stderr, "Couldn't allocate upload buffer!\n");
-        exit(2);
-    }
-
-    dataread = fread(floppy_code, sizeof(BYTE), databytes, fpin);
-
-    if (dataread != databytes)
-    {
-        fprintf(stderr, "Couldn't read all bytes from file %s!\n", floppyfile);
-        exit(3);
-    }
-
-    printf("databytes = %ld\n", databytes);
+    databytes = sizeof(floppy_code);
 
     start = floppy_code[0] + (floppy_code[1] << 8);
     printf("Startadress: $%04x\n",start);
@@ -157,8 +138,6 @@ void upload_code(char *floppyfile)
     cbm_upload(FD, 8, start, floppy_code+2, databytes-2); 
 
     floppybytes = databytes;
-
-    fclose(fpin);
 }
 
 
@@ -526,11 +505,16 @@ int read_d64(FILE *fpout)
     int csec; /* compare sector variable */
     int blockindex;
     int save_errorinfo;
+    int save_40_errors;
+    int save_40_tracks;
     int retry;
     BYTE buffer[0x2100];
+    BYTE* gcr_cycle;
     BYTE id[3];
     BYTE rawdata[260];
     BYTE sectordata[16*21*260];
+    BYTE d64data[MAXBLOCKSONDISK*256];
+    BYTE *d64ptr;
     BYTE errorinfo[MAXBLOCKSONDISK];
     BYTE errorcode;
     int sector_count[21];     /* number of different sector data read */
@@ -540,11 +524,15 @@ int read_d64(FILE *fpout)
     int sector_max[21];       /* # of times the best sector data has occured */
     int goodtrack;
     int goodsector;
+    int any_sectors;           /* any valid sectors on track at all? */
+    int blocks_to_save;
 
 
 
     blockindex = 0;
     save_errorinfo = 0;
+    save_40_errors = 0;
+    save_40_tracks = 0;
 
     density = read_halftrack(18*2, buffer);
     if (!extract_id(buffer, id))
@@ -553,23 +541,32 @@ int read_d64(FILE *fpout)
         return (0);
     }
 
-
-    for (track = 1; track <= 35; track += 1)
+    d64ptr = d64data;
+    for (track = 1; track <= 40; track += 1)
     {
         /* no sector data read in yet */
         for (sector = 0; sector < 21; sector++)
             sector_count[sector] = 0;
 
+        any_sectors = 0;
         for (retry = 0; retry < 16; retry++)
         {
             goodtrack = 1;
             read_halftrack(2*track, buffer);
+            gcr_cycle = find_track_cycle(buffer);
+
+/*
+            if (gcr_cycle != NULL) printf(" cycle: %d ", gcr_cycle-buffer); 
+*/
+
             for (sector = 0; sector < sector_map_1541[track]; sector++)
             {
                 sector_max[sector] = 0;
                 /* convert sector to free sector buffer */
-                errorcode = convert_GCR_sector(buffer, rawdata,
+                errorcode = convert_GCR_sector(buffer, gcr_cycle, rawdata,
                                                track, sector, id);
+
+                if (errorcode == OK) any_sectors = 1;
 
                 /* check, if identical sector has been read before */
                 for (csec = 0; csec < sector_count[sector]; csec++)
@@ -610,27 +607,35 @@ int read_d64(FILE *fpout)
                     goodtrack = 0;
             } /* for sector.... */
             if (goodtrack == 1) break; /* break out of for loop */
+            if ((retry == 1) && (any_sectors==0)) break;
         } /* for retry.... */
 
 
-        /* save the best data for each sector */
+        /* keep the best data for each sector */
 
         for (sector = 0; sector < sector_map_1541[track]; sector++)
         {
             printf("%d",sector);
 
-            if (fwrite((char *) sectordata+1+(21*sector_use[sector]+sector)*260,
-                       256, 1, fpout) != 1)
-            {
-                fprintf(stderr, "Cannot write sector data.\n");
-                return (0);
-            }
+            memcpy(d64ptr, sectordata+1+(21*sector_use[sector]+sector)*260,
+                   256);
+            d64ptr += 256;
 
             errorcode = sector_error[sector][sector_use[sector]];
             errorinfo[blockindex] = errorcode;
-            if (errorcode != OK)
-                save_errorinfo = 1;
 
+            if (errorcode != OK)
+            {
+                if (track <= 35)
+                    save_errorinfo = 1;
+                else
+                    save_40_errors = 1;
+            }
+            else if (track > 35)
+            {
+                save_40_tracks = 1;
+            }
+   
             /* screen information */
             if (errorcode == OK)
                 printf(" ");
@@ -638,10 +643,21 @@ int read_d64(FILE *fpout)
                 printf("%d",errorcode);
             blockindex++;
        }
+
+
     } /* track loop */
+
+    blocks_to_save = (save_40_tracks) ? MAXBLOCKSONDISK : BLOCKSONDISK;
+
+    if (fwrite((char *) d64data, blocks_to_save*256, 1,fpout) != 1)
+    {
+        fprintf(stderr, "Cannot write d64 data.\n");
+        return (0);
+    }
+
     if (save_errorinfo == 1)
     {
-        if (fwrite((char *) errorinfo, blockindex, 1, fpout) != 1)
+        if (fwrite((char *) errorinfo, blocks_to_save, 1, fpout) != 1)
         {
             fprintf(stderr, "Cannot write sector data.\n");
             return (0);

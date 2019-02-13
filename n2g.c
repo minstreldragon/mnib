@@ -5,6 +5,7 @@
     Based on code by Andreas Boose <boose@unixserv.rz.fh-hannover.de>
 
     V 0.21   use correct speed values in G64
+    V 0.22   cleaned up version using gcr.c helper functions
 */
 
 
@@ -12,107 +13,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include "gcr.h"
 
-#define VERSION 0.21
-
-#define BYTE unsigned char
-#define DWORD unsigned int
-#define MAX_TRACKS_1541 42
-
-#define BLOCKSONDISK 683
-#define BLOCKSEXTRA 85
-#define MAXBLOCKSONDISK (BLOCKSONDISK+BLOCKSEXTRA)
-
-#define OK				1
-#define NOT_FOUND_ERROR	4
-#define CHECKSUM_ERROR	5
-
-static char sector_map_1541[43] =
-{
-    0,
-    21, 21, 21, 21, 21, 21, 21, 21, 21, 21,     /*  1 - 10 */
-    21, 21, 21, 21, 21, 21, 21, 19, 19, 19,     /* 11 - 20 */
-    19, 19, 19, 19, 18, 18, 18, 18, 18, 18,     /* 21 - 30 */
-    17, 17, 17, 17, 17,                         /* 31 - 35 */
-    17, 17, 17, 17, 17, 17, 17          /* Tracks 36 - 42 are non-standard. */
-};
+#define VERSION 0.22
 
 
-static int speed_map_1541[42] = { 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-                                  3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1,
-                                  1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                                  0, 0, 0 };
 
-
-static BYTE GCR_conv_data[16] = { 0x0a, 0x0b, 0x12, 0x13,
-                                  0x0e, 0x0f, 0x16, 0x17,
-                                  0x09, 0x19, 0x1a, 0x1b,
-                                  0x0d, 0x1d, 0x1e, 0x15 };
-
-static int GCR_decode[32] = { -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
-                              -1, 0x8, 0x0, 0x1,  -1, 0xc, 0x4, 0x5,
-                              -1,  -1, 0x2, 0x3,  -1, 0xf, 0x6, 0x7,
-                              -1, 0x9, 0xa, 0xb,  -1, 0xd, 0xe,  -1 };
-                             
-
-static void convert_4bytes_to_GCR(BYTE *buffer, BYTE *ptr)
-{
-    *ptr = GCR_conv_data[(*buffer) >> 4] << 3;
-    *ptr |= GCR_conv_data[(*buffer) & 0x0f] >> 2;
-    ptr++;
-
-    *ptr = GCR_conv_data[(*buffer) & 0x0f] << 6;
-    buffer++;
-    *ptr |= GCR_conv_data[(*buffer) >> 4] << 1;
-    *ptr |= GCR_conv_data[(*buffer) & 0x0f] >> 4;
-    ptr++;
-
-    *ptr = GCR_conv_data[(*buffer) & 0x0f] << 4;
-    buffer++;
-    *ptr |= GCR_conv_data[(*buffer) >> 4] >> 1;
-    ptr++;
-
-    *ptr = GCR_conv_data[(*buffer) >> 4] << 7;
-    *ptr |= GCR_conv_data[(*buffer) & 0x0f] << 2;
-    buffer++;
-    *ptr |= GCR_conv_data[(*buffer) >> 4] >> 3;
-    ptr++;
-
-    *ptr = GCR_conv_data[(*buffer) >> 4] << 5;
-    *ptr |= GCR_conv_data[(*buffer) & 0x0f];
-}
-
-
-int convert_4bytes_from_GCR(BYTE *gcr, BYTE *plain)
-{
-    int hnibble, lnibble;
-
-    if((hnibble = GCR_decode[gcr[0] >> 3]) < 0) return -1;
-    if((lnibble = GCR_decode[((gcr[0] << 2) | (gcr[1] >> 6)) & 0x1f]) < 0) return -1;
-    *plain++ = hnibble << 4 | lnibble;
-    if((hnibble = GCR_decode[(gcr[1] >> 1) & 0x1f]) < 0) return -1;
-    if((lnibble = GCR_decode[((gcr[1] << 4) | (gcr[2] >> 4)) & 0x1f]) < 0) return -1;
-    *plain++ = hnibble << 4 | lnibble;
-    if((hnibble = GCR_decode[((gcr[2] << 1) | (gcr[3] >> 7)) & 0x1f]) < 0) return -1;
-    if((lnibble = GCR_decode[(gcr[3] >> 2) & 0x1f]) < 0) return -1;
-    *plain++ = hnibble << 4 | lnibble;
-    if((hnibble = GCR_decode[((gcr[3] << 3) | (gcr[4] >> 5)) & 0x1f]) < 0) return -1;
-    if((lnibble = GCR_decode[gcr[4] & 0x1f]) < 0) return -1;
-    *plain++ = hnibble << 4 | lnibble;
-
-    return(1);
-}
-
-
-BYTE *find_sync(BYTE *pointer, int pos)
+BYTE *find_sync_old(BYTE *pointer, int pos)
 {
     /* first find a Sync byte $ff */
-    for (; (*pointer != 0xff) && (pos < 0x2000); pointer++, pos++);
-    if (pos >= 0x2000) return (NULL);
+    for (; (*pointer != 0xff) && (pos < GCR_TRACK_LENGTH); pointer++, pos++);
+    if (pos >= GCR_TRACK_LENGTH) return (NULL);
 
     /* now find end of Sync */
-    for (; (*pointer == 0xff) && (pos < 0x2000); pointer++, pos++);
-    if (pos >= 0x2000) return (NULL);
+    for (; (*pointer == 0xff) && (pos < GCR_TRACK_LENGTH); pointer++, pos++);
+    if (pos >= GCR_TRACK_LENGTH) return (NULL);
 
     return (pointer);
 }
@@ -130,7 +45,7 @@ int is_sector_zero(BYTE *data)
 
 BYTE *check_vmax(BYTE *mnib_track)
 {
-    static BYTE vmax_track[0x2100];
+    static BYTE vmax_track[GCR_TRACK_LENGTH+0x100];
     BYTE *source, *dest;
     int isvmax;
     BYTE current, pilot;
@@ -138,7 +53,7 @@ BYTE *check_vmax(BYTE *mnib_track)
 
     isvmax=0;
     pilot = 0;
-    for(source = mnib_track, dest = vmax_track; source < mnib_track+0x2000; source++)
+    for(source = mnib_track, dest = vmax_track; source < mnib_track+GCR_TRACK_LENGTH; source++)
     {
         current = *source;
         if (current == 0x49)
@@ -199,10 +114,9 @@ DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
     {
         last_sync_pos = sync_pos;
         syncs++; /* count number of syncs in track */
-        printf(".");
 
         /* find start of next block */
-        sync_pos = find_sync(sync_pos, sync_pos-mnib_track);
+        sync_pos = find_sync_old(sync_pos, sync_pos-mnib_track);
 
         /* if we can't find beginning repeated data we have a problem... */
         if (sync_pos == NULL) return (0);
@@ -210,14 +124,12 @@ DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
         /* check if sector 0 header was found */
         if (is_sector_zero(sync_pos))
         {
-            printf("0");
             sector_zero_pos = sync_pos;
             sector_zero_len = sync_pos - last_sync_pos;
         }
 
         /* check if the last chunk of data had maximal length */
         block_len = sync_pos - last_sync_pos;
-        if (block_len > max_block_len) printf("?");
         max_len_pos  = (block_len > max_block_len) ? sync_pos  : max_len_pos;
         max_block_len = (block_len > max_block_len) ? block_len : max_block_len;
 
@@ -228,27 +140,24 @@ DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
         start_pos = mnib_track;
         for (repeat_pos = sync_pos; sync_pos != NULL; )
         {
-            printf("!");
 
             for (i = 0; i < 7; i++)
                 if (start_pos[i] != repeat_pos[i]) break;
 
             if (i != 7)
             {
-                printf("%d",i);
                 break; /* break out of while loop */
             }
             cycle_pos = sync_pos;
             cyclelen = (cycle_pos - mnib_track);
-            printf("cycle: %d\n", cyclelen);
 
-            start_pos  = find_sync(start_pos, start_pos-mnib_track);
-            repeat_pos = find_sync(repeat_pos, repeat_pos-mnib_track);
+            start_pos  = find_sync_old(start_pos, start_pos-mnib_track);
+            repeat_pos = find_sync_old(repeat_pos, repeat_pos-mnib_track);
 
             if (repeat_pos == NULL) sync_pos = NULL;
 
             /* check if next header is completely available */
-            if ((repeat_pos-mnib_track+10) > 0x2000) sync_pos = NULL;
+            if ((repeat_pos-mnib_track+10) > GCR_TRACK_LENGTH) sync_pos = NULL;
         }
     }
 
@@ -257,13 +166,12 @@ DWORD extract_track(BYTE *mnib_track, BYTE *gcr_track)
         max_len_pos = sector_zero_pos;
     }
 
-    printf("Startpos:  %d\n", max_len_pos-mnib_track);
     if (cyclelen >= 7900)
     {
         max_len_pos = mnib_track;
         cyclelen = 7900; /* hack for psi5 killertrack */
     }
-    printf("Cyclepos:  %d\n", cyclelen);
+    printf("- Cyclepos:  %d", cyclelen);
     if (cyclelen != 7900)
     {
 
@@ -303,7 +211,7 @@ DWORD extract_track_try2(BYTE *mnib_track, BYTE *gcr_track)
     int i;
 
     start_pos = mnib_track;
-    stop_pos = mnib_track+0x2000;
+    stop_pos = mnib_track+GCR_TRACK_LENGTH;
     cycle_pos = NULL;
 
 
@@ -324,7 +232,7 @@ DWORD extract_track_try2(BYTE *mnib_track, BYTE *gcr_track)
 
     cyclelen = cycle_pos-mnib_track;
 
-    printf("Cyclepos:  %d\n", cyclelen);
+    printf("- Cyclepos:  %d", cyclelen);
 
     /* here comes the actual copy loop */
     for (pos = start_pos; pos < cycle_pos; )
@@ -332,65 +240,6 @@ DWORD extract_track_try2(BYTE *mnib_track, BYTE *gcr_track)
 
     return (cyclelen);
 }
-
-
-static int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector, int track,
-                                  int sector, BYTE diskID1, BYTE diskID2)
-{
-    int i;
-    BYTE header[10];
-    BYTE chksum;
-    BYTE *gcr_ptr, *gcr_end;
-    BYTE *sectordata;
-
-
-    if (track > 40) return (0); /* only 40 tracks stored in sixpack */
-
-    if (sector == 0) printf("(%02d) ", track); /* screen info */
-    gcr_ptr = gcr_track;
-    gcr_end= gcr_track+0x2000;
-
-    do
-    {
-        for (; *gcr_ptr != 0xff; gcr_ptr++) /* find sync */
-            if (gcr_ptr >= gcr_end) return (0);
-        for (; *gcr_ptr == 0xff; gcr_ptr++);
-            if (gcr_ptr >= gcr_end) return (0);
-
-        convert_4bytes_from_GCR(gcr_ptr, header);
-        convert_4bytes_from_GCR(gcr_ptr+5, header+4);
-    } while ((header[0]!=0x08) || (header[2]!=sector) || (header[3]!=track));
-
-    if ((header[5]==diskID1) || (header[4]==diskID2))
-        printf(".");
-    else
-        printf("-");
-
-    for (; *gcr_ptr != 0xff; gcr_ptr++) /* find sync */
-        if (gcr_ptr >= gcr_end) return (0);
-    for (; *gcr_ptr == 0xff; gcr_ptr++);
-        if (gcr_ptr >= gcr_end) return (0);
-    
-
-    for (i = 0, sectordata = d64_sector; i < 65; i++)
-    {
-        convert_4bytes_from_GCR(gcr_ptr, sectordata);
-        gcr_ptr += 5;
-        sectordata += 4;
-    }
-
-    for (i = 1, chksum = 0; i < 258; i++)
-        chksum ^= d64_sector[i];
-    if (chksum  != 0)
-	{
-        printf("C");
-		return (CHECKSUM_ERROR);
-	}
-
-    return (OK);
-}
-
-
 
 
 static int write_dword(FILE *fd, DWORD *buf, int num)
@@ -439,20 +288,14 @@ int main(int argc, char **argv)
 {
     FILE *fpin, *fpout;
     char inname[80], outname[80];
-    BYTE *nibbler_data;
-    int track, sector;
-    BYTE gcr_header[12], id[3];
+    int track;
+    BYTE gcr_header[12];
     DWORD gcr_track_p[MAX_TRACKS_1541 * 2];
     DWORD gcr_speed_p[MAX_TRACKS_1541 * 2];
     DWORD track_len;
-    BYTE mnib_track[0x2000];
+    BYTE mnib_track[GCR_TRACK_LENGTH];
     BYTE *source_track;
     BYTE gcr_track[7930];
-    BYTE errorinfo[MAXBLOCKSONDISK];
-    BYTE errorcode;
-    int save_errorinfo;
-    BYTE *gcrptr;
-    unsigned long blockindex;
     BYTE mnib_header[0x100];
 	
 
@@ -460,8 +303,6 @@ int main(int argc, char **argv)
 "\nn2g is a small stand-alone converter to convert mnib data to\n"
 "a standard G64 disk image.  Copyright 2000,01 Markus Brenner.\n"
 "Version %.2f\n\n", VERSION);
-
-    id[0]=id[1]=id[2] = '\0';
 
 
     if (argc == 2)
@@ -546,7 +387,7 @@ int main(int argc, char **argv)
         gcr_track[1] = raw_track_size[speed_map_1541[track]] / 256;
 
         /* read in one track */
-        if (fread(mnib_track, 0x2000, 1, fpin) < 1)
+        if (fread(mnib_track, GCR_TRACK_LENGTH, 1, fpin) < 1)
         {
             /* track doesn't exist: write blank track */
             fprintf(stderr, "Cannot read track from mnib image.\n");

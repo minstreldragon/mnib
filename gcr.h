@@ -2,7 +2,10 @@
 
     (C) 2001 Markus Brenner <markus@brenner.de>
         based on code by Andreas Boose
+
+    V 0.33   improved sector extraction, added find_track_cycle() function
 */
+
 #ifndef _GCR_
 #define _GCR_
 
@@ -19,6 +22,10 @@
 
 /* NIB format constants */
 #define GCR_TRACK_LENGTH 0x2000
+
+/* Conversion routines constants */
+#define MIN_TRACK_LENGTH 0x1780
+#define MATCH_LENGTH 7
 
 /* Disk Controller error codes */
 #define OK                  0x01
@@ -44,8 +51,11 @@ void convert_4bytes_from_GCR(BYTE *gcr, BYTE *plain);
 
 int extract_id(BYTE *gcr_track, BYTE *id);
 
-int convert_GCR_sector(BYTE *gcr_track, BYTE *d64_sector,
-                              int track, int sector, BYTE *id);
+BYTE* find_track_cycle(BYTE *start_pos);
+
+int convert_GCR_sector(BYTE *gcr_start, BYTE *gcr_end,
+                       BYTE *d64_sector,
+                       int track, int sector, BYTE *id);
 
 void convert_sector_to_GCR(BYTE *buffer, BYTE *ptr,
                                   int track, int sector, BYTE *diskID);
