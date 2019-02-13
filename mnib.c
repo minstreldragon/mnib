@@ -4,8 +4,12 @@
 
     V 0.10   implementation of serial and parallel protocol
     V 0.11   first density scan and nibbler functionality
-    V 0.12
-
+    V 0.12   automatic port detection and improved program flow
+    V 0.13   extended data output format
+    V 0.14   fixed parallel port support
+    V 0.15   2nd try for parallel port fix
+    V 0.16   next try with adjustments to ECP ports
+    V 0.17   added automatic drive type detection
 */
 
 #include "cbm.h"
@@ -13,7 +17,7 @@
 #include <stdlib.h>
 #include <sys/movedata.h>
 
-#define VERSION 0.12
+#define VERSION 0.17
 #define FD 1                /* (unused) file number for cbm_routines */
 
 #define FL_STEPTO      0x00
@@ -33,6 +37,7 @@ static int track_inc;
 static int current_track;
 static unsigned int lpt[4];
 static int lpt_num;
+static int drivetype;
 
 char bitrate_range[4] =
 { 42*2, 31*2, 25*2, 18*2 };
@@ -59,6 +64,10 @@ void upload_code(char *floppyfile)
     unsigned int databytes, dataread;
     unsigned char *buffer;
     unsigned int start;
+    unsigned int patch_pos[9] =
+    { 0x72, 0x89, 0x9e, 0x1da, 0x224, 0x258, 0x262, 0x293, 0x2a6 };
+    int i;
+ 
 
     if ((fpin = fopen(floppyfile, "rb")) == NULL)
     {
@@ -89,6 +98,17 @@ void upload_code(char *floppyfile)
     start = buffer[0] + (buffer[1] << 8);
     printf("Startadress: $%04x\n",start);
 
+    /* patch code if using 1571 drive */
+    if (drivetype == 1571)
+    {
+        for (i = 0; i < 9; i++)
+        {
+            if (buffer[patch_pos[i]] != 0x18)
+                printf("Possibly bad patch at %04x!\n",patch_pos[i]);
+            buffer[patch_pos[i]] = 0x40;
+        }
+    }
+
     cbm_upload(FD, 8, start, buffer+2, databytes-2); 
 
     free(buffer);
@@ -110,12 +130,14 @@ int test_par_port()
     int i;
     int byte;
     int rv;
+    int test[0x100];
 
     send_par_cmd(FL_TEST);
     for (i = 0, rv = 1; i < 0x100; i++)
     {
 /*
         printf("%02x ", byte = cbm_par_read(FD));
+        if (byte != i) rv = 0;
 */
         if (cbm_par_read(FD) != i) rv = 0;
     }
@@ -293,11 +315,12 @@ int scan_density(void)
 }
 
 
-int readdisk(FILE *fpout)
+int readdisk(FILE *fpout, char *track_header)
 {
     int track;
     int density, defdensity;
     int i;
+    int header_entry;
     unsigned char buffer[0x2000];
 
     if (!test_par_port()) return 0;
@@ -305,10 +328,12 @@ int readdisk(FILE *fpout)
     printf("READ DISK\n");  
     motor_on();
     delay(500);
+    header_entry = 0;
     for (track = start_track; track <= end_track; track += track_inc)
     {
         step_to_halftrack(track);
         printf("\n%02d: ",track);
+
 
         for (defdensity = 3; track >= bitrate_range[defdensity]; defdensity--);
         printf("(%d) ", (defdensity & 3));
@@ -326,7 +351,11 @@ int readdisk(FILE *fpout)
             density = defdensity;
         }
         else printf("%d", (density & 3));
+        density = defdensity;
 
+        track_header[header_entry*2] = track;
+        track_header[header_entry*2+1] = density;
+        header_entry++;
 
         send_par_cmd(FL_DENSITY);
         cbm_par_write(FD, density_branch[density]);
@@ -361,6 +390,7 @@ int main(int argc, char *argv[])
     unsigned char error[500];
     unsigned char cmd[80];
     char outname[80];
+    char header[0x100];
 
     FILE *fpout;
 
@@ -381,63 +411,47 @@ int main(int argc, char *argv[])
         exit(2);
     }
 
+    memset(header, 0x00, 0x100);
+    sprintf(header, "MNIB-1541-RAW%c%c%c",1,0,0);
+    for (i = 0; i < 0x100; i++)
+    {
+        fputc(header[i], fpout);
+    }
+
     if (!detect_ports()) exit (3);
+
+    /* prepare error string $73: CBM DOS V2.6 1541 */
+    sprintf(cmd,"M-W%c%c%c%c%c%c%c%c",0,3,5,0xa9,0x73,0x4c,0xc1,0xe6);
+    cbm_exec_command(fd, 8, cmd, 11);
+    sprintf(cmd,"M-E%c%c",0x00,0x03);
+    cbm_exec_command(fd, 8, cmd, 5);
+    cbm_device_status(fd, 8, error, 500);
+    printf("Drive Version: %s\n", error);
+
+    if (error[18] == '4')
+        drivetype = 1541;
+    else if (error[18] == '7')
+        drivetype = 1571;
+    else
+        drivetype = 0; /* unknown drive, use 1541 code */
+
+    printf("Drive type: %d\n", drivetype);
+    
 
     cbm_exec_command(fd, 8, "U0>M0", 0);
     cbm_exec_command(fd, 8, "I0:", 0);
     printf("Initialising disk\n");
-/*
-
-    delay(10000);
-
-    sprintf(cmd,"M-W%c%c%c%c%c",0x06,0x00,0x02,17,0);
-    cbm_listen(FD,8,15);
-    cbm_write(FD,cmd,8);
-    cbm_unlisten(FD);
-
-    sprintf(cmd,"M-W%c%c%c%c",0x00,0x00,0x01,0x80);
-    cbm_listen(FD,8,15);
-    cbm_write(FD,cmd,7);
-    cbm_unlisten(FD);
-
-    delay(5000);
-
-    cbm_exec_command(fd, 8, "I0:", 0);
-    printf("Initialising disk\n");
-
-    delay(5000);
-
-    delay(10000);
-
-*/
-
-/*
-    sprintf(cmd,"M-W%c%c%c%c",0x00,0x00,0x01,0x80);
-    cbm_listen(FD,8,15);
-    cbm_write(FD,cmd,7);
-    cbm_unlisten(FD);
-
-    delay(5000);
-
-    sprintf(cmd,"M-R%c%c%c",0,0,1);
-    cbm_exec_command(fd, 8, cmd, 0);
-
-    cbm_talk(fd,8,15);
-    cbm_read(fd,buffer,1);
-    cbm_untalk(fd);
- 
-    printf("read 00: %02x\n", buffer[0]);
-    printf("Bumping\n");
-    delay(5000);
-*/
 
     upload_code("bn_flop.prg");
     sprintf(cmd,"M-E%c%c",0x00,0x03);
+    cbm_exec_command(fd, 8, cmd, 5);
+/*
     cbm_listen(FD,8,15);
     cbm_write(FD,cmd,5);
     cbm_unlisten(FD);
+*/
 
-    printf("%02x \n",cbm_par_read(FD));
+    cbm_par_read(FD);
     if (!find_par_port()) exit (4);
 
 /*
@@ -445,8 +459,16 @@ int main(int argc, char *argv[])
 */
 
     fprintf(stderr, "test: %s\n", test_par_port() ? "OK" : "FAILED");
-    readdisk(fpout);
+    readdisk(fpout, header+0x10);
     printf("%02x \n",cbm_par_read(FD));
+
+
+    rewind(fpout);
+    for (i = 0; i < 0x100; i++)
+    {
+        fputc(header[i], fpout);
+    }
+    fseek(fpout, 0, SEEK_END);
     fclose(fpout);
 
     motor_on();

@@ -23,8 +23,12 @@
 #include "kernel.h"
 
 /* unsigned int serport        = 0x378; */      /* 'serial' LPT port address */
-unsigned int serport        = 0x3bc;       /* 'serial' LPT port address */
-unsigned int parport        = 0x378;       /* 'parallel' LPT port address */
+// unsigned int serport        = 0x3bc;       /* 'serial' LPT port address */
+// unsigned int parport        = 0x378;       /* 'parallel' LPT port address */
+
+unsigned int serport;   /* 'serial' LPT port address */
+unsigned int parport;   /* 'parallel' LPT port address */
+
 
 /* symbolic names */
 #define IEC_DATA   1
@@ -49,12 +53,16 @@ unsigned int parport        = 0x378;       /* 'parallel' LPT port address */
 static int lpt_num;                        /* # of available printer ports */
 static unsigned int lpt[4];                /* port addresses */
 
-static unsigned char serportval;           /* current value in output register */
-static unsigned char parportval;           /* current value in output register */
+static unsigned char *serportval;           /* current value in output register */
+static unsigned char *parportval;           /* current value in output register */
+static unsigned char portval[4];           /* current value in output register */
 
-#define SET(line)       (outportb(serport+2,(serportval|=line)^OUTMASK))
-#define RELEASE(line)   (outportb(serport+2,(serportval&=~(line))^OUTMASK))
+#define SET(line)       (outportb(serport+2,(*serportval|=line)^OUTMASK))
+#define RELEASE(line)   (outportb(serport+2,(*serportval&=~(line))^OUTMASK))
 #define GET(line)       (((inportb(serport+1)^INMASK)&line)==0?1:0)
+
+#define PARREAD()       (outportb(parport+2,(*parportval|=0x20)^OUTMASK))
+#define PARWRITE()      (outportb(parport+2,(*parportval&=0xdf)^OUTMASK))
 
 #ifdef DEBUG
   #define DPRINTK(fmt,args...)     printf(fmt, ## args)
@@ -389,9 +397,9 @@ int cbm_ioctl(int f, unsigned int cmd, unsigned long arg)
                         return 0;
 
                 case CBMCTRL_PP_READ:
-                        outportb(parport+2, parportval | 0x20);
+                        PARREAD();
                         rv = inportb(parport);
-                        outportb(parport+2, parportval);
+                        PARWRITE();
                         return rv;
 
                 case CBMCTRL_PP_WRITE:
@@ -399,24 +407,24 @@ int cbm_ioctl(int f, unsigned int cmd, unsigned long arg)
                         return 0;
 
                 case CBMCTRL_PAR_READ:
-                        outportb(parport+2, parportval | 0x20);
+//                        PARREAD();
                         RELEASE(DATA_OUT|CLK_OUT);
                         SET(ATN_OUT);
-                        msleep(10); /* 200? */
+//                        msleep(10); /* 200? */
                         while(GET(DATA_IN));
                         rv = inportb(parport);
                         RELEASE(ATN_OUT);
                         msleep(10);
                         while(!GET(DATA_IN));
-                        outportb(parport+2, parportval);
+//                        PARWRITE();
                         return rv;
 
                 case CBMCTRL_PAR_WRITE:
-                        outportb(parport+2, parportval);
                         RELEASE(DATA_OUT|CLK_OUT);
                         SET(ATN_OUT);
                         msleep(10);
                         while(GET(DATA_IN));
+                        PARWRITE();
                         outportb(parport, arg);
 /*
                         msleep(10);
@@ -424,6 +432,7 @@ int cbm_ioctl(int f, unsigned int cmd, unsigned long arg)
                         RELEASE(ATN_OUT);
                         msleep(10);
                         while(!GET(DATA_IN));
+                        PARREAD();
 /*
                         msleep(10);
 */
@@ -434,7 +443,7 @@ int cbm_ioctl(int f, unsigned int cmd, unsigned long arg)
 
 int cbm_nib_read1(int f)
 {
-    outportb(parport+2, parportval | 0x20);
+//    PARREAD();
     RELEASE(DATA_OUT);
     while (GET(DATA_IN));
 /*
@@ -445,7 +454,7 @@ int cbm_nib_read1(int f)
 
 int cbm_nib_read2(int f)
 {
-    outportb(parport+2, parportval | 0x20);
+//    PARREAD();
     RELEASE(DATA_OUT);
     while (!GET(DATA_IN));
 /*
@@ -496,8 +505,8 @@ int set_par_port(int port)
     if (port < lpt_num)
     {
         parport = lpt[port];
-        parportval   = inportb(parport+2)&0xdf;
-        outportb(parport+2,parportval);
+        parportval = &portval[port];
+        PARREAD();
         printf("Port %d: %04x ", port, lpt[port]);
         return (1);
     }
@@ -509,8 +518,22 @@ int detect_ports()
 {
     int i;
     unsigned char byte[8];
-    unsigned int port, goodport;
+    unsigned int port;
     int found;
+    int goodport;
+
+    unsigned char ecr;
+    char *ecpm[8] = 
+    {
+        "SPP",
+        "Byte",
+        "Fast Centronics",
+        "ECP",
+        "EPP",
+        "Reserved",
+        "Test",
+        "Configuration"
+    };
 
     _dosmemgetb(0x411, 1, byte);
     lpt_num = (byte[0] & 0xc0) >> 6;
@@ -524,20 +547,39 @@ int detect_ports()
         lpt[i] = port;
     }
 
-    goodport = 0;
+
+    /* on ECP ports force BYTE mode */
+    for (i = 0; i < lpt_num; i++)
+    {
+        port = lpt[i];
+        ecr = inportb(port+0x402);
+        outportb(port+0x402, 0x34);
+        outportb(port+2, 0xc6);
+        if (inportb(port+0x402) != 0x35) continue; /* no ECP port */
+        printf("ECP port at %04x in %s Mode\n", port, ecpm[(ecr&0xe0)>>5]);
+        printf("Forcing Byte Mode\n");
+        outportb(port+0x402, (ecr & 0x1f) | 0x20);
+    }
+
+
+    goodport = -1;
     for (i = 0; i < lpt_num; i++)
     {
         irq_count = 0;
-        serportval   = 0xc0;
+        portval[i] = 0xc0;
+        serportval   = &portval[i];
         found = scan_xe1541(lpt[i]);
-        if ((goodport==0) && found) goodport = lpt[i];
+        if ((goodport== (-1)) && found) goodport = i;
         printf("Port %d: %04x - %s\n", i, lpt[i], found ? "Found!" : "none");
     }
 
-    if (goodport != 0)
+    if (goodport != -1)
     {
-        printf("Using port %04x for XE1541 connection.\n", goodport);
-        serport = goodport;
+        printf("Using port %04x for XE1541 connection.\n", lpt[goodport]);
+        serport = lpt[goodport];
+        parport = lpt[goodport];
+        serportval = &portval[goodport];
+        parportval = &portval[goodport];
         RELEASE(DATA_OUT | CLK_OUT);
         SET(CLK_OUT);
         return (1);

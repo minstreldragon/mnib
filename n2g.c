@@ -474,8 +474,17 @@ int main(int argc, char **argv)
     
             printf("\nTrack: %2d ",track+1);
             track_len = extract_track(mnib_track, gcr_track+2);
+
+            if (track_len == 0)
+            {
+                track_len = raw_track_size[speed_map_1541[track]];
+                memset(&gcr_track[2], 0x55, track_len);
+                gcr_track[2] = 0xff;
+            }
+
             gcr_track[0] = track_len % 256;
             gcr_track[1] = track_len / 256;
+
             if (fwrite((char *) gcr_track, sizeof(gcr_track), 1, fpout) != 1)
             {
                 fprintf(stderr, "Cannot write track data.\n");
