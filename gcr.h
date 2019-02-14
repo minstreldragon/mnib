@@ -4,6 +4,7 @@
         based on code by Andreas Boose
 
     V 0.33   improved sector extraction, added find_track_cycle() function
+    V 0.34   added MAX_SYNC_OFFSET constant, approximated to 800 GCR bytes
 */
 
 #ifndef _GCR_
@@ -26,6 +27,12 @@
 /* Conversion routines constants */
 #define MIN_TRACK_LENGTH 0x1780
 #define MATCH_LENGTH 7
+/* number of GCR bytes until NO SYNC error
+   timer counts down from $d000 to $8000 ($20480 cycles)
+   until timeout when waiting for a SYNC signal
+   This is approx. 20.48 ms, which is approx 1/10th disk revolution
+   8000 GCR bytes / 10 = 800 bytes */
+#define MAX_SYNC_OFFSET 800
 
 /* Disk Controller error codes */
 #define OK                  0x01

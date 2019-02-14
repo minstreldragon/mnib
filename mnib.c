@@ -26,6 +26,7 @@
     V 0.31   added 40 track support for D64 images
     V 0.32   bin-include bn_flop.prg  (bin2h bn_flop.prg floppy_code bn_flop.h)
     V 0.33   improved D64 mode
+    V 0.33a  VCFe3 release (35 track flag)
 */
 
 #include <stdio.h>
@@ -61,6 +62,7 @@ static int start_track;
 static int end_track;
 static int track_inc;
 static int use_default_density;
+static int no_extra_tracks;
 static int current_track;
 static unsigned int lpt[4];
 static int lpt_num;
@@ -88,6 +90,7 @@ void usage(void)
     fprintf(stderr, " -d: Use scanned density\n");
     fprintf(stderr, " -h: Add Halftracks\n");
     fprintf(stderr, " -r: Reset Drives\n");
+    fprintf(stderr, " -35: 35 tracks only\n");
 
     exit(1);
 }
@@ -693,6 +696,7 @@ int main(int argc, char *argv[])
     end_track = 41*2;
     track_inc = 2;
     use_default_density = 1;
+    no_extra_tracks = 0;
     disktype = DISK_NORMAL;
 
     while (--argc && (*(++argv)[0] == '-'))
@@ -713,6 +717,10 @@ int main(int argc, char *argv[])
                 break;
             case 'g':
                 disktype = DISK_GEOS;
+                break;
+            case '3':
+                no_extra_tracks = 1; 
+                end_track = 35*2;
                 break;
             default:
                 break;

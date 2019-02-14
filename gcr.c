@@ -7,6 +7,7 @@
     V 0.31   improved error handling of convert_GCR_sector()
     V 0.32   removed some functions, added sector-2-GCR conversion
     V 0.33   improved sector extraction, added find_track_cycle() function
+    V 0.34   added MAX_SYNC_OFFSET constant, for better error conversion
 */
 
 #include <stdio.h>
@@ -157,7 +158,7 @@ int convert_GCR_sector(BYTE *gcr_start, BYTE *gcr_cycle,
     BYTE hdr_chksum;    /* header checksum */
     BYTE blk_chksum;    /* block  checksum */
     BYTE gcr_buffer[2*GCR_TRACK_LENGTH];
-    BYTE *gcr_ptr, *gcr_end;
+    BYTE *gcr_ptr, *gcr_end, *gcr_last;
     BYTE *sectordata;
     int error_code;
     int sync_found;
@@ -195,6 +196,19 @@ int convert_GCR_sector(BYTE *gcr_start, BYTE *gcr_cycle,
         }
     }
     if (sync_found != 3) return(SYNC_NOT_FOUND);
+
+
+    /* Check for missing SYNCs */
+    gcr_last = gcr_ptr = gcr_buffer;
+    while (gcr_ptr < gcr_end)
+    {
+        find_sync(&gcr_ptr, gcr_end);
+        if ((gcr_ptr-gcr_last) > MAX_SYNC_OFFSET)
+            return (SYNC_NOT_FOUND);
+        else
+            gcr_last = gcr_ptr;
+    }
+
 
     /* Try to find block header for Track/Sector */
     gcr_ptr = gcr_buffer;
